@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECHO Testbench</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Courier New', monospace;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: #16213e;
+    border-bottom: 1px solid #0f3460;
+  }
+  .header h1 {
+    font-size: 18px;
+    color: #e94560;
+    letter-spacing: 2px;
+  }
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .server-url {
+    background: #0f3460;
+    border: 1px solid #1a1a4e;
+    color: #888;
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    border-radius: 4px;
+    width: 260px;
+  }
+  .btn-full-flow {
+    background: #e94560;
+    color: #fff;
+    border: none;
+    padding: 8px 18px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: bold;
+    border-radius: 4px;
+    cursor: pointer;
+    letter-spacing: 1px;
+  }
+  .btn-full-flow:hover { background: #ff6b6b; }
+  .btn-full-flow:disabled { background: #555; cursor: not-allowed; }
+
+  /* Main panels */
+  .panels {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .panel {
+    flex: 1;
+    padding: 16px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .panel-alice { border-right: 1px solid #0f3460; }
+  .panel-session {
+    flex: 0.8;
+    border-right: 1px solid #0f3460;
+    align-items: center;
+  }
+  .panel-bob { }
+
+  .panel-title {
+    font-size: 16px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+  .panel-alice .panel-title { color: #00d2ff; }
+  .panel-bob .panel-title { color: #ff6b6b; }
+  .panel-session .panel-title { color: #e94560; }
+
+  /* Buttons */
+  .btn-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .btn {
+    padding: 8px 16px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: bold;
+    border: 1px solid;
+    border-radius: 4px;
+    cursor: pointer;
+    background: transparent;
+    transition: background 0.15s;
+    min-width: 90px;
+  }
+  .btn:hover { filter: brightness(1.3); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-alice {
+    color: #00d2ff;
+    border-color: #00d2ff;
+  }
+  .btn-alice:hover { background: rgba(0,210,255,0.1); }
+  .btn-bob {
+    color: #ff6b6b;
+    border-color: #ff6b6b;
+  }
+  .btn-bob:hover { background: rgba(255,107,107,0.1); }
+  .btn-session {
+    color: #e94560;
+    border-color: #e94560;
+  }
+  .btn-session:hover { background: rgba(233,69,96,0.1); }
+
+  /* Input fields */
+  .input-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    justify-content: center;
+  }
+  .input {
+    background: #0f3460;
+    border: 1px solid #1a1a4e;
+    color: #e0e0e0;
+    padding: 6px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    border-radius: 4px;
+    width: 140px;
+  }
+  .input:focus { border-color: #e94560; outline: none; }
+
+  /* Identity cards */
+  .id-card {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 11px;
+    line-height: 1.8;
+  }
+  .id-card .label {
+    color: #888;
+    display: inline-block;
+    width: 80px;
+  }
+  .id-card .value {
+    color: #e0e0e0;
+  }
+
+  /* Session zone */
+  .session-section {
+    width: 100%;
+    text-align: center;
+    margin-top: 8px;
+  }
+  .session-section h3 {
+    font-size: 12px;
+    color: #888;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+  }
+  .transparency-badge {
+    display: inline-block;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    margin-top: 8px;
+  }
+  .badge-verified {
+    background: rgba(0,200,83,0.15);
+    color: #00c853;
+    border: 1px solid #00c853;
+  }
+  .badge-unknown {
+    background: rgba(136,136,136,0.15);
+    color: #888;
+    border: 1px solid #555;
+  }
+  .badge-error {
+    background: rgba(255,82,82,0.15);
+    color: #ff5252;
+    border: 1px solid #ff5252;
+  }
+
+  /* Log panel */
+  .log-panel {
+    height: 220px;
+    min-height: 160px;
+    background: #0d1117;
+    border-top: 1px solid #0f3460;
+    overflow-y: auto;
+    padding: 8px 14px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .log-entry {
+    display: flex;
+    gap: 10px;
+    white-space: nowrap;
+  }
+  .log-time { color: #555; min-width: 60px; }
+  .log-identity { min-width: 60px; font-weight: bold; }
+  .log-identity.alice { color: #00d2ff; }
+  .log-identity.bob { color: #ff6b6b; }
+  .log-identity.system { color: #e94560; }
+  .log-cmd { color: #888; min-width: 80px; }
+  .log-msg { color: #e0e0e0; overflow: hidden; text-overflow: ellipsis; }
+  .log-level { min-width: 70px; font-weight: bold; text-align: right; }
+  .log-level.success { color: #00c853; }
+  .log-level.error { color: #ff5252; }
+  .log-level.pending { color: #ffab00; }
+  .log-level.info { color: #888; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <h1>ECHO TESTBENCH</h1>
+  <div class="header-right">
+    <input type="text" class="server-url" id="serverUrl" value="http://localhost:8080" readonly>
+    <button class="btn-full-flow" id="btnFullFlow" onclick="fullFlow()">FULL FLOW</button>
+  </div>
+</div>
+
+<!-- Main Panels -->
+<div class="panels">
+
+  <!-- Alice Panel -->
+  <div class="panel panel-alice">
+    <div class="panel-title">ALICE</div>
+    <div class="btn-row">
+      <button class="btn btn-alice" onclick="doRegister('alice')">Register</button>
+      <button class="btn btn-alice" onclick="doWhoami('alice')">Whoami</button>
+    </div>
+    <div class="input-row">
+      <input class="input" id="aliceMsg" placeholder="message..." value="Hello Bob!">
+      <button class="btn btn-alice" onclick="doSend('alice')">Send</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-alice" onclick="doRecv('alice')">Receive</button>
+      <button class="btn btn-alice" onclick="doMonitor('alice')">Monitor</button>
+      <button class="btn btn-alice" onclick="doReset('alice')">Reset</button>
+    </div>
+    <div class="id-card" id="cardAlice">
+      <div><span class="label">Device:</span> <span class="value" id="aliceDevice">—</span></div>
+      <div><span class="label">Account:</span> <span class="value" id="aliceAccount">—</span></div>
+      <div><span class="label">Ed25519:</span> <span class="value" id="aliceEd">—</span></div>
+      <div><span class="label">X25519:</span> <span class="value" id="aliceDh">—</span></div>
+      <div><span class="label">OTPs:</span> <span class="value" id="aliceOtp">—</span></div>
+      <div><span class="label">Sessions:</span> <span class="value" id="aliceSessions">—</span></div>
+    </div>
+  </div>
+
+  <!-- Session Panel -->
+  <div class="panel panel-session">
+    <div class="panel-title">LINK</div>
+
+    <div class="session-section">
+      <h3>SESSION</h3>
+      <button class="btn btn-session" onclick="doSession('alice')">A → B  X4DH</button>
+      <br><br>
+      <button class="btn btn-session" onclick="doSession('bob')">B → A  X4DH</button>
+    </div>
+
+    <div class="session-section">
+      <h3>TRANSPARENCY</h3>
+      <div class="transparency-badge badge-unknown" id="badgeAlice">ALICE: —</div>
+      <br>
+      <div class="transparency-badge badge-unknown" id="badgeBob">BOB: —</div>
+    </div>
+  </div>
+
+  <!-- Bob Panel -->
+  <div class="panel panel-bob">
+    <div class="panel-title">BOB</div>
+    <div class="btn-row">
+      <button class="btn btn-bob" onclick="doRegister('bob')">Register</button>
+      <button class="btn btn-bob" onclick="doWhoami('bob')">Whoami</button>
+    </div>
+    <div class="input-row">
+      <input class="input" id="bobMsg" placeholder="message..." value="Hi Alice!">
+      <button class="btn btn-bob" onclick="doSend('bob')">Send</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-bob" onclick="doRecv('bob')">Receive</button>
+      <button class="btn btn-bob" onclick="doMonitor('bob')">Monitor</button>
+      <button class="btn btn-bob" onclick="doReset('bob')">Reset</button>
+    </div>
+    <div class="id-card" id="cardBob">
+      <div><span class="label">Device:</span> <span class="value" id="bobDevice">—</span></div>
+      <div><span class="label">Account:</span> <span class="value" id="bobAccount">—</span></div>
+      <div><span class="label">Ed25519:</span> <span class="value" id="bobEd">—</span></div>
+      <div><span class="label">X25519:</span> <span class="value" id="bobDh">—</span></div>
+      <div><span class="label">OTPs:</span> <span class="value" id="bobOtp">—</span></div>
+      <div><span class="label">Sessions:</span> <span class="value" id="bobSessions">—</span></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Log Panel -->
+<div class="log-panel" id="logPanel"></div>
+
+<script>
+// ── State ────────────────────────────────────────────────────
+const devices = { alice: null, bob: null };
+
+// ── SSE Log Stream ───────────────────────────────────────────
+const logPanel = document.getElementById('logPanel');
+const evtSource = new EventSource('/api/logs');
+
+evtSource.onmessage = (e) => {
+  try {
+    const entry = JSON.parse(e.data);
+    const div = document.createElement('div');
+    div.className = 'log-entry';
+    div.innerHTML = `
+      <span class="log-time">${esc(entry.timestamp)}</span>
+      <span class="log-identity ${esc(entry.identity)}">[${esc(entry.identity)}]</span>
+      <span class="log-cmd">${esc(entry.command)}</span>
+      <span class="log-msg">${esc(entry.message)}</span>
+      <span class="log-level ${esc(entry.level)}">${esc(entry.level).toUpperCase()}</span>
+    `;
+    logPanel.appendChild(div);
+    logPanel.scrollTop = logPanel.scrollHeight;
+  } catch (_) {}
+};
+
+evtSource.onerror = () => {
+  addLocalLog('system', 'sse', 'error', 'SSE connection lost — retrying...');
+};
+
+function addLocalLog(identity, cmd, level, msg) {
+  const now = new Date().toTimeString().slice(0,8);
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+  div.innerHTML = `
+    <span class="log-time">${esc(now)}</span>
+    <span class="log-identity ${esc(identity)}">[${esc(identity)}]</span>
+    <span class="log-cmd">${esc(cmd)}</span>
+    <span class="log-msg">${esc(msg)}</span>
+    <span class="log-level ${esc(level)}">${esc(level).toUpperCase()}</span>
+  `;
+  logPanel.appendChild(div);
+  logPanel.scrollTop = logPanel.scrollHeight;
+}
+
+// ── API calls ────────────────────────────────────────────────
+async function api(path, body) {
+  const resp = await fetch('/api/' + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(text || resp.statusText);
+  }
+  return resp.json();
+}
+
+async function doRegister(who) {
+  disableAll(true);
+  try {
+    const phone = who === 'alice' ? '+15551000001' : '+15551000002';
+    await api('register', { identity: who, phone });
+    await refreshState(who);
+  } catch (e) {
+    addLocalLog(who, 'register', 'error', e.message);
+  }
+  disableAll(false);
+}
+
+async function doWhoami(who) {
+  disableAll(true);
+  try {
+    const data = await api('whoami', { identity: who });
+    if (data.device) {
+      devices[who] = data.device.trim();
+    }
+    await refreshState(who);
+  } catch (e) {
+    addLocalLog(who, 'whoami', 'error', e.message);
+  }
+  disableAll(false);
+}
+
+async function doSession(who) {
+  disableAll(true);
+  try {
+    const other = who === 'alice' ? 'bob' : 'alice';
+    if (!devices[other]) {
+      addLocalLog(who, 'session', 'error', `No device ID for ${other} — run Whoami first`);
+      disableAll(false);
+      return;
+    }
+    await api('session', { identity: who, device: devices[other] });
+    await refreshState(who);
+  } catch (e) {
+    addLocalLog(who, 'session', 'error', e.message);
+  }
+  disableAll(false);
+}
+
+async function doSend(who) {
+  disableAll(true);
+  try {
+    const other = who === 'alice' ? 'bob' : 'alice';
+    if (!devices[other]) {
+      addLocalLog(who, 'send', 'error', `No device ID for ${other} — run Whoami first`);
+      disableAll(false);
+      return;
+    }
+    const msgInput = document.getElementById(who + 'Msg');
+    const msg = msgInput.value || 'test message';
+    await api('send', { identity: who, to: devices[other], message: msg });
+  } catch (e) {
+    addLocalLog(who, 'send', 'error', e.message);
+  }
+  disableAll(false);
+}
+
+async function doRecv(who) {
+  disableAll(true);
+  try {
+    await api('recv', { identity: who });
+  } catch (e) {
+    addLocalLog(who, 'recv', 'error', e.message);
+  }
+  disableAll(false);
+}
+
+async function doMonitor(who) {
+  disableAll(true);
+  try {
+    const data = await api('monitor', { identity: who });
+    const badge = document.getElementById('badge' + cap(who));
+    if (data.verified) {
+      badge.className = 'transparency-badge badge-verified';
+      badge.textContent = who.toUpperCase() + ': VERIFIED';
+    } else {
+      badge.className = 'transparency-badge badge-error';
+      badge.textContent = who.toUpperCase() + ': FAILED';
+    }
+  } catch (e) {
+    addLocalLog(who, 'monitor', 'error', e.message);
+    const badge = document.getElementById('badge' + cap(who));
+    badge.className = 'transparency-badge badge-error';
+    badge.textContent = who.toUpperCase() + ': ERROR';
+  }
+  disableAll(false);
+}
+
+async function doReset(who) {
+  disableAll(true);
+  try {
+    await api('reset', { identity: who });
+    devices[who] = null;
+    clearCard(who);
+    const badge = document.getElementById('badge' + cap(who));
+    badge.className = 'transparency-badge badge-unknown';
+    badge.textContent = who.toUpperCase() + ': —';
+  } catch (e) {
+    addLocalLog(who, 'reset', 'error', e.message);
+  }
+  disableAll(false);
+}
+
+// ── State refresh ────────────────────────────────────────────
+async function refreshState(who) {
+  try {
+    const data = await api('state', { identity: who });
+    if (!data.exists) {
+      clearCard(who);
+      return;
+    }
+    setField(who, 'Device', data.device_id || '—');
+    setField(who, 'Account', data.account_id || '—');
+    setField(who, 'Ed', data.identity_ed_public || '—');
+    setField(who, 'Dh', data.identity_dh_public || '—');
+    setField(who, 'Otp', data.otp_count != null ? String(data.otp_count) : '—');
+    setField(who, 'Sessions', data.session_count != null ? String(data.session_count) : '—');
+
+    if (data.device_id) {
+      devices[who] = data.device_id;
+    }
+  } catch (_) {}
+}
+
+function clearCard(who) {
+  ['Device','Account','Ed','Dh','Otp','Sessions'].forEach(f => setField(who, f, '—'));
+}
+
+function setField(who, field, val) {
+  const el = document.getElementById(who + field);
+  if (el) el.textContent = val;
+}
+
+// ── Full Flow ────────────────────────────────────────────────
+async function fullFlow() {
+  const btn = document.getElementById('btnFullFlow');
+  btn.disabled = true;
+  btn.textContent = 'RUNNING...';
+
+  addLocalLog('system', 'flow', 'pending', '=== FULL FLOW START ===');
+
+  try {
+    // 1. Reset both
+    addLocalLog('system', 'flow', 'info', 'Step 1/8: Reset');
+    await api('reset', { identity: 'alice' });
+    await api('reset', { identity: 'bob' });
+    clearCard('alice');
+    clearCard('bob');
+    devices.alice = null;
+    devices.bob = null;
+
+    // 2. Register
+    addLocalLog('system', 'flow', 'info', 'Step 2/8: Register Alice');
+    await api('register', { identity: 'alice', phone: '+15551000001' });
+    await refreshState('alice');
+
+    addLocalLog('system', 'flow', 'info', 'Step 3/8: Register Bob');
+    await api('register', { identity: 'bob', phone: '+15551000002' });
+    await refreshState('bob');
+
+    // 3. Whoami to get device IDs
+    addLocalLog('system', 'flow', 'info', 'Step 4/8: Whoami');
+    const aliceWho = await api('whoami', { identity: 'alice' });
+    if (aliceWho.device) devices.alice = aliceWho.device.trim();
+    await refreshState('alice');
+
+    const bobWho = await api('whoami', { identity: 'bob' });
+    if (bobWho.device) devices.bob = bobWho.device.trim();
+    await refreshState('bob');
+
+    if (!devices.alice || !devices.bob) {
+      throw new Error('Missing device IDs after whoami');
+    }
+
+    // 4. Alice → Bob session
+    addLocalLog('system', 'flow', 'info', 'Step 5/8: Session Alice → Bob');
+    await api('session', { identity: 'alice', device: devices.bob });
+    await refreshState('alice');
+
+    // 5. Alice sends
+    addLocalLog('system', 'flow', 'info', 'Step 6/8: Alice sends message');
+    await api('send', { identity: 'alice', to: devices.bob, message: 'Hello from the Full Flow!' });
+
+    // 6. Bob receives
+    addLocalLog('system', 'flow', 'info', 'Step 7/8: Bob receives');
+    await api('recv', { identity: 'bob' });
+    await refreshState('bob');
+
+    // 7. Monitor both
+    addLocalLog('system', 'flow', 'info', 'Step 8/8: Monitor transparency');
+    try {
+      const monA = await api('monitor', { identity: 'alice' });
+      const badgeA = document.getElementById('badgeAlice');
+      badgeA.className = 'transparency-badge ' + (monA.verified ? 'badge-verified' : 'badge-error');
+      badgeA.textContent = 'ALICE: ' + (monA.verified ? 'VERIFIED' : 'FAILED');
+    } catch (_) {}
+
+    try {
+      const monB = await api('monitor', { identity: 'bob' });
+      const badgeB = document.getElementById('badgeBob');
+      badgeB.className = 'transparency-badge ' + (monB.verified ? 'badge-verified' : 'badge-error');
+      badgeB.textContent = 'BOB: ' + (monB.verified ? 'VERIFIED' : 'FAILED');
+    } catch (_) {}
+
+    addLocalLog('system', 'flow', 'success', '=== FULL FLOW COMPLETE ===');
+  } catch (e) {
+    addLocalLog('system', 'flow', 'error', 'Flow failed: ' + e.message);
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'FULL FLOW';
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function disableAll(disabled) {
+  document.querySelectorAll('.btn').forEach(b => b.disabled = disabled);
+}
+
+// ── Init: load state on page open ────────────────────────────
+(async function init() {
+  await refreshState('alice');
+  await refreshState('bob');
+  addLocalLog('system', 'init', 'success', 'Dashboard ready');
+})();
+</script>
+
+</body>
+</html>

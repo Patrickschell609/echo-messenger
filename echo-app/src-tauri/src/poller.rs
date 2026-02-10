@@ -1,0 +1,1174 @@
+use std::time::Duration;
+
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::time;
+
+use base64::Engine as _;
+
+use echo_client::http::HttpClient;
+use echo_client::identity::SessionMeta;
+use echo_client::wire::WireMessage;
+use echo_client::ws::{WsClient, WsInbound, WsOutbound};
+use echo_crypto::ratchet::state::RatchetState;
+
+use echo_client::wire::ConversationSettings;
+
+use crate::commands::messaging::{build_media_text, media_dir};
+use crate::events;
+use crate::state::{AppState, ChatMessage, GroupChatMessage};
+
+/// Start the background poller. Attempts WebSocket first, falls back to 3s polling.
+pub fn start_poller(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut ws_backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(60);
+
+        loop {
+            let state = app.state::<AppState>();
+            let signed_in = *state.signed_in.lock().unwrap();
+            if !signed_in {
+                time::sleep(Duration::from_secs(1)).await;
+                ws_backoff = Duration::from_secs(1);
+                continue;
+            }
+
+            // Try WebSocket connection
+            let ws_result = try_ws_connect(&app).await;
+            match ws_result {
+                Ok((mut rx, ws_tx, handle)) => {
+                    ws_backoff = Duration::from_secs(1);
+                    // Store WS sender for typing indicators
+                    *app.state::<AppState>().ws_tx.lock().unwrap() = Some(ws_tx);
+                    emit_connection_state(&app, "live");
+
+                    // WS message loop
+                    let mut prekey_timer = time::interval(Duration::from_secs(30));
+                    loop {
+                        tokio::select! {
+                            Some(inbound) = rx.recv() => {
+                                match inbound {
+                                    WsInbound::NewMessage { id, envelope, queued_at } => {
+                                        let qm = echo_client::http::QueuedMessage {
+                                            id,
+                                            envelope,
+                                            queued_at,
+                                        };
+                                        process_single_message(&app, &qm).await;
+                                    }
+                                    WsInbound::Typing { sender_device_id } => {
+                                        app.emit(events::EVENT_TYPING, &sender_device_id.to_string()).ok();
+                                    }
+                                    WsInbound::Delivered { sender_device_id, up_to_timestamp } => {
+                                        // A peer confirmed delivery of our messages
+                                        let state = app.state::<AppState>();
+                                        let peer = sender_device_id.to_string();
+                                        {
+                                            let history = state.history.lock().unwrap();
+                                            if let Some(ref h) = *history {
+                                                h.update_sent_status(&peer, up_to_timestamp as u64, 1).ok();
+                                            }
+                                        }
+                                        app.emit(events::EVENT_DELIVERED, &serde_json::json!({
+                                            "peer_id": peer,
+                                            "up_to_timestamp": up_to_timestamp
+                                        })).ok();
+                                    }
+                                    WsInbound::Read { sender_device_id, up_to_timestamp } => {
+                                        // A peer confirmed they read our messages
+                                        let state = app.state::<AppState>();
+                                        let peer = sender_device_id.to_string();
+                                        {
+                                            let history = state.history.lock().unwrap();
+                                            if let Some(ref h) = *history {
+                                                h.update_sent_status(&peer, up_to_timestamp as u64, 2).ok();
+                                            }
+                                        }
+                                        app.emit(events::EVENT_READ, &serde_json::json!({
+                                            "peer_id": peer,
+                                            "up_to_timestamp": up_to_timestamp
+                                        })).ok();
+                                    }
+                                    WsInbound::Ping => {}
+                                }
+                            }
+                            _ = prekey_timer.tick() => {
+                                // Periodic prekey check, key rotation, outbox drain, group poll, and purge in WS mode
+                                check_and_replenish_prekeys(&app).await;
+                                check_and_rotate_keys(&app).await;
+                                drain_outbox(&app).await;
+                                poll_group_messages(&app).await;
+                                purge_expired_messages(&app);
+                            }
+                            else => {
+                                // WS channel closed
+                                break;
+                            }
+                        }
+                    }
+
+                    handle.abort();
+                    *app.state::<AppState>().ws_tx.lock().unwrap() = None;
+                    tracing::info!("ws disconnected, falling back to polling");
+                    emit_connection_state(&app, "polling");
+                }
+                Err(e) => {
+                    tracing::debug!("ws connect failed: {}, polling", e);
+                    emit_connection_state(&app, "polling");
+                }
+            }
+
+            // Fallback: poll for a while, then retry WS
+            let poll_rounds = (ws_backoff.as_secs() / 3).max(1);
+            for _ in 0..poll_rounds {
+                let state = app.state::<AppState>();
+                let signed_in = *state.signed_in.lock().unwrap();
+                if !signed_in {
+                    break;
+                }
+
+                if let Err(e) = poll_messages(&app).await {
+                    tracing::warn!("poll error: {}", e);
+                }
+
+                // Prekey check + key rotation + outbox drain + group poll + purge during polling too
+                check_and_replenish_prekeys(&app).await;
+                check_and_rotate_keys(&app).await;
+                drain_outbox(&app).await;
+                poll_group_messages(&app).await;
+                purge_expired_messages(&app);
+
+                time::sleep(Duration::from_secs(3)).await;
+            }
+
+            // Exponential backoff for WS reconnect
+            ws_backoff = (ws_backoff * 2).min(max_backoff);
+        }
+    });
+}
+
+fn emit_connection_state(app: &AppHandle, mode: &str) {
+    app.emit(events::EVENT_CONNECTION_STATE, mode).ok();
+}
+
+/// Try to establish a WebSocket connection.
+async fn try_ws_connect(
+    app: &AppHandle,
+) -> anyhow::Result<(
+    tokio::sync::mpsc::Receiver<WsInbound>,
+    tokio::sync::mpsc::Sender<WsOutbound>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let state = app.state::<AppState>();
+
+    let (base_url, device_id, ed_private) = {
+        let identity = state.identity.lock().unwrap();
+        let identity_state = identity.as_ref().ok_or_else(|| anyhow::anyhow!("no identity"))?;
+        let http = state.http.lock().unwrap();
+        let http_ref = http.as_ref().ok_or_else(|| anyhow::anyhow!("no http"))?;
+        let base_url = http_ref.base_url().to_string();
+        let device_id = identity_state.device_id;
+        let mut ed_bytes = [0u8; 32];
+        ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+        (base_url, device_id, ed_bytes)
+    };
+
+    let ws_client = WsClient::new(&base_url, device_id, &ed_private);
+    ws_client.connect().await
+}
+
+/// Process a single queued message (shared by WS and poll paths).
+async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedMessage) {
+    let state = app.state::<AppState>();
+
+    let identity_state = {
+        let id = state.identity.lock().unwrap();
+        match id.as_ref() {
+            Some(s) => s.clone(),
+            None => return,
+        }
+    };
+
+    let keys = identity_state.reconstruct_keys();
+
+    let envelope_bytes = match hex::decode(&qm.envelope) {
+        Ok(b) => b,
+        Err(_) => {
+            app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: invalid envelope hex", qm.id)).ok();
+            ack_single(app, qm.id).await;
+            return;
+        }
+    };
+
+    let envelope: echo_crypto::SealedEnvelope = match bincode::deserialize(&envelope_bytes) {
+        Ok(e) => e,
+        Err(_) => {
+            app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: envelope deserialization failed", qm.id)).ok();
+            ack_single(app, qm.id).await;
+            return;
+        }
+    };
+
+    // Load server transparency key for mandatory cert verification
+    let server_pk: Option<[u8; 32]> = {
+        let vault = state.vault.lock().unwrap();
+        vault.load_server_transparency_key().and_then(|hex_str| {
+            let bytes = hex::decode(&hex_str).ok()?;
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            }
+        })
+    };
+
+    let (sender_cert, inner) = match echo_crypto::sealed_sender::unseal_message(
+        &keys.identity_dh,
+        &envelope,
+        server_pk.as_ref(),
+    ) {
+        Ok(r) => r,
+        Err(_) => {
+            app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: unseal/cert verification failed", qm.id)).ok();
+            return;
+        }
+    };
+
+    let sender_device_id = sender_cert.sender_device_id;
+    let sender_uuid = uuid::Uuid::from_bytes(sender_device_id.0);
+
+    let wire_msg: WireMessage = match bincode::deserialize(&inner) {
+        Ok(m) => m,
+        Err(_) => {
+            app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: wire message corrupted", qm.id)).ok();
+            ack_single(app, qm.id).await;
+            return;
+        }
+    };
+
+    let (header_bytes, encrypted_header, ciphertext, prekey_data) = match wire_msg {
+        WireMessage::PreKey {
+            sender_identity_key,
+            sender_identity_dh_key,
+            ephemeral_public,
+            pq_ciphertext,
+            used_one_time_prekey_id,
+            ratchet_header,
+            encrypted_header,
+            ciphertext,
+        } => (
+            ratchet_header,
+            encrypted_header,
+            ciphertext,
+            Some((sender_identity_key, sender_identity_dh_key, ephemeral_public, pq_ciphertext, used_one_time_prekey_id)),
+        ),
+        WireMessage::Normal {
+            ratchet_header,
+            encrypted_header,
+            ciphertext,
+        } => (ratchet_header, encrypted_header, ciphertext, None),
+    };
+
+    let header: echo_crypto::MessageHeader = match bincode::deserialize(&header_bytes) {
+        Ok(h) => h,
+        Err(_) => {
+            app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: header deserialization failed", qm.id)).ok();
+            ack_single(app, qm.id).await;
+            return;
+        }
+    };
+
+    let enc_msg = echo_crypto::ratchet::session::EncryptedMessage {
+        header,
+        encrypted_header,
+        ciphertext,
+    };
+
+    // Try existing session from vault
+    let session_result: Option<(RatchetState, SessionMeta)> = {
+        let vault = state.vault.lock().unwrap();
+        vault.load_session(sender_uuid).ok()
+    };
+
+    if let Some((ratchet_state, _meta)) = session_result {
+        let mut session = echo_crypto::ratchet::TripleRatchetSession::new(ratchet_state);
+        if let Ok(decrypted) = session.decrypt(&enc_msg) {
+            {
+                let vault = state.vault.lock().unwrap();
+                if vault.update_session(sender_uuid, session.export_state()).is_err() {
+                    tracing::warn!("failed to persist ratchet for {}, skipping ack", sender_uuid);
+                    return;
+                }
+            }
+            ack_single(app, qm.id).await;
+
+            // Check if this is a sender key distribution (group key setup)
+            if let Some(skd) = echo_client::wire::decode_skd(&decrypted.plaintext) {
+                process_sender_key_distribution(app, &skd);
+                return;
+            }
+
+            // Check if this is a control message (auto-delete, edit, delete)
+            if let Some(ctrl) = echo_client::wire::decode_ctrl(&decrypted.plaintext) {
+                process_control_message(app, &sender_uuid.to_string(), ctrl);
+                return;
+            }
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let msg_id = format!("{}-{}", sender_uuid, qm.id);
+
+            let (history_text, display_text, media_url, media_mime, media_filename) =
+                decode_media_payload(&decrypted.plaintext, &sender_uuid.to_string(), now);
+
+            // Check conversation timer for auto-delete expiry
+            let expires_at = {
+                let vault = state.vault.lock().unwrap();
+                let settings: ConversationSettings = vault
+                    .read_file(&format!("conversations/{}.enc", sender_uuid))
+                    .unwrap_or_default();
+                if settings.auto_delete_secs > 0 {
+                    Some(now + settings.auto_delete_secs)
+                } else {
+                    None
+                }
+            };
+
+            // Insert into encrypted history (with optional expiry)
+            {
+                let history = state.history.lock().unwrap();
+                if let Some(ref h) = *history {
+                    h.insert_message_with_expiry(&msg_id, &sender_uuid.to_string(), &history_text, false, now, expires_at).ok();
+                }
+            }
+
+            let chat_msg = ChatMessage {
+                id: msg_id,
+                from_device: sender_uuid.to_string(),
+                text: display_text,
+                sent_by_me: false,
+                timestamp: now,
+                status: 0,
+                edited: false,
+                media_url,
+                media_mime,
+                media_filename,
+            };
+            app.emit(events::EVENT_NEW_MESSAGE, &chat_msg).ok();
+
+            // Send delivery receipt via WS
+            send_delivery_receipt(app, sender_uuid, now);
+        }
+    } else if let Some((sender_ik, sender_dh_key, ephemeral_pub, pq_ct, otpk_id)) = prekey_data {
+        let mut eph = [0u8; 32];
+        eph.copy_from_slice(&ephemeral_pub);
+        let mut sdk = [0u8; 32];
+        sdk.copy_from_slice(&sender_dh_key);
+
+        let otp_keypair = otpk_id.and_then(|id| {
+            keys.one_time_prekeys.iter().find(|(kid, _)| *kid == id).map(|(_, kp)| kp)
+        });
+
+        let x4dh_result = match echo_crypto::ratchet::x4dh::X4DH::respond(
+            &keys.identity_ed,
+            &keys.identity_dh,
+            &keys.signed_prekey,
+            otp_keypair,
+            &keys.pq_sk,
+            &echo_crypto::PublicKey(sdk),
+            &echo_crypto::PublicKey(eph),
+            &echo_crypto::PqCiphertext(pq_ct.clone()),
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let mut sik = [0u8; 32];
+        sik.copy_from_slice(&sender_ik);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let ratchet_state = echo_crypto::ratchet::state::RatchetState {
+            local_identity: keys.identity_ed.public_key(),
+            remote_identity: echo_crypto::IdentityPublicKey(sik),
+            epoch_number: 0,
+            my_epoch_pk: None,
+            my_epoch_sk: None,
+            peer_epoch_pk: None,
+            epoch_message_count: 0,
+            epoch_start_time: now,
+            dh_ratchet_number: 0,
+            my_dh_public: keys.signed_prekey.public_key(),
+            my_dh_private: Some(keys.signed_prekey.private_key_bytes()),
+            peer_dh_public: Some(enc_msg.header.dh_public.clone()),
+            root_key: x4dh_result.root_key.clone(),
+            sending_chain_key: None,
+            receiving_chain_key: Some(x4dh_result.chain_key),
+            send_message_number: 0,
+            recv_message_number: 0,
+            prev_sending_chain_length: 0,
+            sending_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, false)),
+            receiving_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, true)),
+            next_sending_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, false)),
+            next_receiving_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, true)),
+            skipped_keys: std::collections::HashMap::new(),
+            processed_ids: std::collections::HashSet::new(),
+            processed_order: std::collections::VecDeque::new(),
+        };
+
+        let meta = SessionMeta {
+            recipient_device_id: sender_uuid,
+            recipient_identity_key: sender_ik.clone(),
+            recipient_dh_key: echo_crypto::PublicKey(sdk),
+            ephemeral_public: ephemeral_pub,
+            pq_ciphertext: pq_ct,
+            used_one_time_prekey_id: None,
+            needs_prekey_message: true,
+        };
+
+        let mut session = echo_crypto::ratchet::TripleRatchetSession::new(ratchet_state);
+        if let Ok(decrypted) = session.decrypt(&enc_msg) {
+            {
+                let vault = state.vault.lock().unwrap();
+                if vault.save_session(sender_uuid, session.export_state(), &meta).is_err() {
+                    tracing::warn!("failed to persist new session for {}, skipping ack", sender_uuid);
+                    return;
+                }
+            }
+            ack_single(app, qm.id).await;
+            app.emit(events::EVENT_SESSION_ESTABLISHED, &sender_uuid.to_string()).ok();
+
+            // Check if this is a sender key distribution (group key setup)
+            if let Some(skd) = echo_client::wire::decode_skd(&decrypted.plaintext) {
+                process_sender_key_distribution(app, &skd);
+                return;
+            }
+
+            // Check if this is a control message (auto-delete, edit, delete)
+            if let Some(ctrl) = echo_client::wire::decode_ctrl(&decrypted.plaintext) {
+                process_control_message(app, &sender_uuid.to_string(), ctrl);
+                return;
+            }
+
+            let msg_id = format!("{}-{}", sender_uuid, qm.id);
+
+            let (history_text, display_text, media_url, media_mime, media_filename) =
+                decode_media_payload(&decrypted.plaintext, &sender_uuid.to_string(), now);
+
+            // Check conversation timer for auto-delete expiry
+            let expires_at = {
+                let vault = state.vault.lock().unwrap();
+                let settings: ConversationSettings = vault
+                    .read_file(&format!("conversations/{}.enc", sender_uuid))
+                    .unwrap_or_default();
+                if settings.auto_delete_secs > 0 {
+                    Some(now + settings.auto_delete_secs)
+                } else {
+                    None
+                }
+            };
+
+            // Insert into encrypted history (with optional expiry)
+            {
+                let history = state.history.lock().unwrap();
+                if let Some(ref h) = *history {
+                    h.insert_message_with_expiry(&msg_id, &sender_uuid.to_string(), &history_text, false, now, expires_at).ok();
+                }
+            }
+
+            let chat_msg = ChatMessage {
+                id: msg_id,
+                from_device: sender_uuid.to_string(),
+                text: display_text,
+                sent_by_me: false,
+                timestamp: now,
+                status: 0,
+                edited: false,
+                media_url,
+                media_mime,
+                media_filename,
+            };
+            app.emit(events::EVENT_NEW_MESSAGE, &chat_msg).ok();
+
+            // Send delivery receipt via WS
+            send_delivery_receipt(app, sender_uuid, now);
+        }
+    }
+}
+
+/// Decode decrypted plaintext: detect media content, save to disk, return display info.
+fn decode_media_payload(
+    plaintext: &[u8],
+    peer_id: &str,
+    timestamp: u64,
+) -> (String, String, Option<String>, Option<String>, Option<String>) {
+    if let Some(media) = echo_client::wire::MediaContent::decode(plaintext) {
+        // Save to disk
+        let peer_dir = media_dir().join(peer_id);
+        std::fs::create_dir_all(&peer_dir).ok();
+        let safe_name: String = media.filename
+            .replace(['/', '\\', '\0', ':', '<', '>', '|', '"', '?', '*'], "_")
+            .replace("..", "_");
+        let safe_name = safe_name.trim_matches(|c: char| c == '.' || c == ' ' || c == '_').to_string();
+        let safe_name = if safe_name.is_empty() { "file".to_string() } else { safe_name };
+        let local_path = peer_dir.join(format!("{}_{}", timestamp, safe_name));
+        std::fs::write(&local_path, &media.data).ok();
+
+        let history_text =
+            build_media_text(&media.mime_type, &media.filename, &local_path.to_string_lossy());
+
+        // Build data URL for immediate display
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&media.data);
+        let data_url = format!("data:{};base64,{}", media.mime_type, b64);
+
+        (
+            history_text,
+            media.filename.clone(),
+            Some(data_url),
+            Some(media.mime_type),
+            Some(media.filename),
+        )
+    } else {
+        let text = String::from_utf8_lossy(plaintext).to_string();
+        (text.clone(), text, None, None, None)
+    }
+}
+
+/// Send a delivery receipt to the sender via WS (graceful no-op if polling).
+fn send_delivery_receipt(app: &AppHandle, sender: uuid::Uuid, timestamp: u64) {
+    let state = app.state::<AppState>();
+    let ws_tx = {
+        let tx = state.ws_tx.lock().unwrap();
+        tx.clone()
+    };
+    if let Some(tx) = ws_tx {
+        let _ = tx.try_send(WsOutbound::Delivered {
+            recipient_device_id: sender.to_string(),
+            up_to_timestamp: timestamp as i64,
+        });
+    }
+}
+
+/// Ack a single message.
+async fn ack_single(app: &AppHandle, msg_id: i64) {
+    let state = app.state::<AppState>();
+    let (device_id, http) = {
+        let identity = state.identity.lock().unwrap();
+        let identity_state = match identity.as_ref() {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                (identity_state.device_id, HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes))
+            }
+            None => return,
+        }
+    };
+    http.ack_messages(device_id, &[msg_id]).await.ok();
+}
+
+/// Poll-based message fetching (fallback when WS is not available).
+async fn poll_messages(app: &AppHandle) -> anyhow::Result<()> {
+    let state = app.state::<AppState>();
+
+    let (device_id, identity_state) = {
+        let id = state.identity.lock().unwrap();
+        match id.as_ref() {
+            Some(s) => (s.device_id, s.clone()),
+            None => return Ok(()),
+        }
+    };
+
+    let http = {
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), device_id, &ed_bytes)
+            }
+            None => return Ok(()),
+        }
+    };
+
+    let messages = http.receive_messages(device_id).await?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    for qm in &messages {
+        process_single_message(app, qm).await;
+    }
+
+    Ok(())
+}
+
+/// Check one-time prekey count and replenish if low (Phase 3).
+async fn check_and_replenish_prekeys(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    let (device_id, identity_state) = {
+        let id = state.identity.lock().unwrap();
+        match id.as_ref() {
+            Some(s) => (s.device_id, s.clone()),
+            None => return,
+        }
+    };
+
+    let http = {
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), device_id, &ed_bytes)
+            }
+            None => return,
+        }
+    };
+
+    let count = match http.prekey_count().await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if count >= 25 {
+        return;
+    }
+
+    tracing::info!("prekey count low ({}), replenishing...", count);
+
+    // Determine next_prekey_id from identity state
+    let next_id = identity_state
+        .one_time_prekeys
+        .iter()
+        .map(|(id, _)| *id)
+        .max()
+        .unwrap_or(100) + 1;
+
+    let new_prekeys = echo_client::identity::KeyMaterial::generate_additional_prekeys(next_id, 100);
+
+    // Build upload payload
+    let otpks: Vec<(u32, String)> = new_prekeys
+        .iter()
+        .map(|(id, kp)| (*id, hex::encode(&kp.public_key().0)))
+        .collect();
+
+    if let Err(e) = http.upload_additional_otps(&otpks).await {
+        tracing::warn!("failed to upload additional prekeys: {}", e);
+        return;
+    }
+
+    // Save private keys to vault
+    {
+        let mut id_guard = state.identity.lock().unwrap();
+        if let Some(ref mut id_state) = *id_guard {
+            for (kid, kp) in &new_prekeys {
+                id_state
+                    .one_time_prekeys
+                    .push((*kid, kp.private_key_bytes().0.to_vec()));
+            }
+            let vault = state.vault.lock().unwrap();
+            vault.write_file("identity.enc", id_state).ok();
+        }
+    }
+
+    tracing::info!("replenished 100 prekeys starting from id {}", next_id);
+}
+
+/// Check if keys need rotation (Phase 4).
+async fn check_and_rotate_keys(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    let identity_state = {
+        let id = state.identity.lock().unwrap();
+        match id.as_ref() {
+            Some(s) => s.clone(),
+            None => return,
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let last_rotation = identity_state.last_rotation_time.unwrap_or(0);
+    let seven_days = 7 * 24 * 60 * 60;
+
+    if last_rotation > 0 && (now - last_rotation) < seven_days {
+        return;
+    }
+
+    // Skip on first run if we just created the account (last_rotation == 0 and keys are fresh)
+    if last_rotation == 0 && identity_state.signed_prekey_id <= 1 {
+        // Mark current time as last rotation so we start the 7-day clock
+        let mut id_guard = state.identity.lock().unwrap();
+        if let Some(ref mut id_state) = *id_guard {
+            id_state.last_rotation_time = Some(now);
+            let vault = state.vault.lock().unwrap();
+            vault.write_file("identity.enc", id_state).ok();
+        }
+        return;
+    }
+
+    tracing::info!("rotating signed prekey and PQ prekey...");
+
+    let keys = identity_state.reconstruct_keys();
+
+    // Generate new signed prekey
+    let new_spk_id = identity_state.signed_prekey_id + 1;
+    let (new_spk, new_spk_sig) = echo_client::identity::KeyMaterial::rotate_signed_prekey(
+        &keys.identity_ed,
+        new_spk_id,
+    );
+
+    // Generate new PQ prekey
+    let new_pq_id = identity_state.pq_prekey_id + 1;
+    let (new_pq_pk, new_pq_sk, new_pq_sig) = echo_client::identity::KeyMaterial::rotate_pq_prekey(
+        &keys.identity_ed,
+        new_pq_id,
+    );
+
+    // Upload via existing upload_prekeys (server UPSERT handles it)
+    let http = {
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+            }
+            None => return,
+        }
+    };
+
+    // Build a KeyMaterial with new keys for upload
+    let upload_keys = echo_client::identity::KeyMaterial {
+        identity_ed: keys.identity_ed,
+        identity_dh: keys.identity_dh,
+        signed_prekey: new_spk,
+        signed_prekey_id: new_spk_id,
+        signed_prekey_sig: new_spk_sig,
+        pq_pk: new_pq_pk,
+        pq_sk: new_pq_sk.clone(),
+        pq_prekey_id: new_pq_id,
+        pq_prekey_sig: new_pq_sig,
+        one_time_prekeys: vec![], // Don't re-upload OTPs during rotation
+    };
+
+    if let Err(e) = http
+        .upload_prekeys(identity_state.account_id, &upload_keys, None)
+        .await
+    {
+        tracing::warn!("key rotation upload failed: {}", e);
+        return;
+    }
+
+    // Update identity state with new keys, stash old ones as grace period
+    let grace_expiry = now + 14 * 24 * 60 * 60; // 14 days
+
+    {
+        let mut id_guard = state.identity.lock().unwrap();
+        if let Some(ref mut id_state) = *id_guard {
+            // Stash current keys as previous
+            id_state.prev_signed_prekey_private = Some(id_state.signed_prekey_private.clone());
+            id_state.prev_signed_prekey_id = Some(id_state.signed_prekey_id);
+            id_state.prev_pq_sk = Some(id_state.pq_sk.clone());
+            id_state.prev_pq_prekey_id = Some(id_state.pq_prekey_id);
+            id_state.prev_key_expiry = Some(grace_expiry);
+
+            // Set new keys
+            id_state.signed_prekey_private = upload_keys.signed_prekey.private_key_bytes().0.to_vec();
+            id_state.signed_prekey_public = upload_keys.signed_prekey.public_key().0.to_vec();
+            id_state.signed_prekey_id = new_spk_id;
+            id_state.pq_pk = upload_keys.pq_pk.0.clone();
+            id_state.pq_sk = new_pq_sk.0.clone();
+            id_state.pq_prekey_id = new_pq_id;
+            id_state.last_rotation_time = Some(now);
+
+            let vault = state.vault.lock().unwrap();
+            vault.write_file("identity.enc", id_state).ok();
+        }
+    }
+
+    tracing::info!("key rotation complete: spk_id={}, pq_id={}", new_spk_id, new_pq_id);
+}
+
+/// Drain outbox — attempt to send queued messages.
+async fn drain_outbox(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    let entries = {
+        let outbox = state.outbox.lock().unwrap();
+        match outbox.as_ref() {
+            Some(ob) => match ob.pending_messages() {
+                Ok(e) => e,
+                Err(_) => return,
+            },
+            None => return,
+        }
+    };
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let identity_state = {
+        let id = state.identity.lock().unwrap();
+        match id.as_ref() {
+            Some(s) => s.clone(),
+            None => return,
+        }
+    };
+
+    let http = {
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+            }
+            None => return,
+        }
+    };
+
+    for entry in &entries {
+        let recipient: uuid::Uuid = match entry.recipient_device_id.parse() {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        match http.send_message(recipient, &entry.envelope).await {
+            Ok(()) => {
+                // Remove from outbox
+                {
+                    let outbox = state.outbox.lock().unwrap();
+                    if let Some(ref ob) = *outbox {
+                        ob.mark_sent(entry.id).ok();
+                    }
+                }
+
+                // Update history status from queued (3) → sent (0)
+                {
+                    let history = state.history.lock().unwrap();
+                    if let Some(ref h) = *history {
+                        h.set_message_status(&entry.msg_id, 0).ok();
+                    }
+                }
+
+                // Notify frontend
+                app.emit(events::EVENT_MESSAGE_SENT, &serde_json::json!({
+                    "msg_id": entry.msg_id,
+                    "peer_id": entry.recipient_device_id,
+                })).ok();
+
+                tracing::info!("outbox: sent queued message {} to {}", entry.msg_id, entry.recipient_device_id);
+            }
+            Err(_) => {
+                // Still offline — stop trying (will retry next cycle)
+                break;
+            }
+        }
+    }
+}
+
+/// Process a sender key distribution received via pairwise session.
+fn process_sender_key_distribution(
+    app: &AppHandle,
+    skd: &echo_crypto::group::SenderKeyDistribution,
+) {
+    let state = app.state::<AppState>();
+    let group_id_str = uuid::Uuid::from_bytes(skd.group_id).to_string();
+
+    let vault = state.vault.lock().unwrap();
+
+    // Load or create a group session for this group
+    let mut session = match vault.load_group_session(&group_id_str) {
+        Some(s) => s,
+        None => {
+            // We received a sender key but don't have a session yet.
+            // Create one — we'll get our own device id from identity state.
+            let device_id = {
+                let id = state.identity.lock().unwrap();
+                match id.as_ref() {
+                    Some(s) => {
+                        let bytes = s.device_id.as_bytes();
+                        echo_crypto::types::DeviceId(*bytes)
+                    }
+                    None => return,
+                }
+            };
+            echo_crypto::group::GroupSession::new(skd.group_id, device_id)
+        }
+    };
+
+    session.process_sender_key(skd);
+
+    vault.save_group_session(&group_id_str, &session).ok();
+
+    tracing::info!(
+        "processed sender key from {:?} for group {}",
+        skd.sender_device,
+        group_id_str
+    );
+}
+
+/// Process a control message received from a peer.
+fn process_control_message(
+    app: &AppHandle,
+    sender_uuid_str: &str,
+    ctrl: echo_client::wire::ControlMessage,
+) {
+    let state = app.state::<AppState>();
+
+    match ctrl {
+        echo_client::wire::ControlMessage::SetTimer { duration_secs } => {
+            // Validate: reject absurd timer values (max 30 days)
+            const MAX_TIMER_SECS: u64 = 30 * 24 * 60 * 60;
+            if duration_secs > MAX_TIMER_SECS {
+                tracing::warn!(
+                    "rejecting SetTimer from {} with duration {}s (max {})",
+                    sender_uuid_str, duration_secs, MAX_TIMER_SECS
+                );
+                return;
+            }
+
+            // Save setting to vault
+            {
+                let vault = state.vault.lock().unwrap();
+                let settings = ConversationSettings {
+                    auto_delete_secs: duration_secs,
+                };
+                vault
+                    .write_file(
+                        &format!("conversations/{}.enc", sender_uuid_str),
+                        &settings,
+                    )
+                    .ok();
+            }
+
+            // Apply timer to existing messages
+            {
+                let history = state.history.lock().unwrap();
+                if let Some(ref h) = *history {
+                    h.set_expires_for_peer(sender_uuid_str, duration_secs).ok();
+                }
+            }
+
+            app.emit(
+                events::EVENT_TIMER_CHANGED,
+                &serde_json::json!({
+                    "peer_id": sender_uuid_str,
+                    "duration_secs": duration_secs,
+                }),
+            )
+            .ok();
+
+            tracing::info!(
+                "timer set to {}s for conversation with {}",
+                duration_secs,
+                sender_uuid_str
+            );
+        }
+        echo_client::wire::ControlMessage::EditMessage {
+            sender_msg_id: _,
+            original_timestamp,
+            new_text,
+        } => {
+            // Validate: reject oversized edit text (max 10KB)
+            if new_text.len() > 10_000 {
+                tracing::warn!(
+                    "rejecting EditMessage from {} with text length {} (max 10000)",
+                    sender_uuid_str, new_text.len()
+                );
+                return;
+            }
+
+            let history = state.history.lock().unwrap();
+            if let Some(ref h) = *history {
+                // Find message by peer + approximate timestamp (receiver stored it as received)
+                if let Ok(Some(row_id)) =
+                    h.find_message_by_peer_and_time(sender_uuid_str, false, original_timestamp)
+                {
+                    h.edit_message(row_id, sender_uuid_str, &new_text).ok();
+                    let msg_id = h.get_msg_id(row_id).ok().flatten().unwrap_or_default();
+                    app.emit(
+                        events::EVENT_MESSAGE_EDITED,
+                        &serde_json::json!({
+                            "peer_id": sender_uuid_str,
+                            "msg_id": msg_id,
+                            "new_text": new_text,
+                        }),
+                    )
+                    .ok();
+                    tracing::info!("edited message {} from {}", row_id, sender_uuid_str);
+                }
+            }
+        }
+        echo_client::wire::ControlMessage::DeleteMessage {
+            sender_msg_id: _,
+            original_timestamp,
+        } => {
+            let history = state.history.lock().unwrap();
+            if let Some(ref h) = *history {
+                if let Ok(Some(row_id)) =
+                    h.find_message_by_peer_and_time(sender_uuid_str, false, original_timestamp)
+                {
+                    let msg_id = h.get_msg_id(row_id).ok().flatten().unwrap_or_default();
+                    h.delete_message(row_id).ok();
+                    app.emit(
+                        events::EVENT_MESSAGE_DELETED,
+                        &serde_json::json!({
+                            "peer_id": sender_uuid_str,
+                            "msg_id": msg_id,
+                        }),
+                    )
+                    .ok();
+                    tracing::info!("deleted message {} from {}", row_id, sender_uuid_str);
+                }
+            }
+        }
+    }
+}
+
+/// Purge expired messages and emit event if any were deleted.
+fn purge_expired_messages(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let history = state.history.lock().unwrap();
+    if let Some(ref h) = *history {
+        if let Ok(count) = h.purge_expired() {
+            if count > 0 {
+                app.emit(events::EVENT_MESSAGES_EXPIRED, count).ok();
+                tracing::info!("purged {} expired messages", count);
+            }
+        }
+    }
+}
+
+/// Poll group messages for all groups we're a member of.
+async fn poll_group_messages(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    let http = {
+        let identity = state.identity.lock().unwrap();
+        let id_state = match identity.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&id_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), id_state.device_id, &ed_bytes)
+            }
+            None => return,
+        }
+    };
+
+    let device_id = {
+        let id = state.identity.lock().unwrap();
+        match id.as_ref() {
+            Some(s) => s.device_id,
+            None => return,
+        }
+    };
+
+    // List our groups
+    let groups = match http.list_groups().await {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    for group in &groups {
+        let group_uuid = match uuid::Uuid::parse_str(&group.group_id) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+
+        let messages = match http.receive_group_messages(group_uuid).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        for gm in &messages {
+            // Skip our own messages
+            if gm.sender_device_id == device_id.to_string() {
+                continue;
+            }
+
+            let payload_bytes = match hex::decode(&gm.payload) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let group_msg: echo_crypto::group::GroupMessage = match bincode::deserialize(&payload_bytes) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            // Decrypt using our group session
+            let plaintext = {
+                let vault = state.vault.lock().unwrap();
+                let mut session = match vault.load_group_session(&group.group_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let result = session.decrypt(&group_msg);
+
+                // Save updated session state
+                vault.save_group_session(&group.group_id, &session).ok();
+
+                match result {
+                    Ok(pt) => pt,
+                    Err(e) => {
+                        tracing::warn!("group decrypt failed for {}: {}", group.group_id, e);
+                        continue;
+                    }
+                }
+            };
+
+            let text = String::from_utf8_lossy(&plaintext).to_string();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let msg_id = format!("grp-{}-{}", group.group_id, gm.id);
+
+            // Store in history
+            {
+                let history = state.history.lock().unwrap();
+                if let Some(ref h) = *history {
+                    // Use sender_device_id as the "peer" within group context
+                    h.insert_message(&msg_id, &group.group_id, &text, false, now).ok();
+                }
+            }
+
+            let chat_msg = GroupChatMessage {
+                id: msg_id,
+                group_id: group.group_id.clone(),
+                from_device: gm.sender_device_id.clone(),
+                text,
+                sent_by_me: false,
+                timestamp: now,
+            };
+
+            app.emit(events::EVENT_GROUP_MESSAGE, &chat_msg).ok();
+        }
+    }
+}

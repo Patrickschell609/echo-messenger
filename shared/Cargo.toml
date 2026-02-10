@@ -1,0 +1,33 @@
+[package]
+name = "echo-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Triple Ratchet (TR3) cryptographic core for ECHO Messenger"
+
+[lib]
+name = "echo_crypto"
+crate-type = ["lib", "staticlib", "cdylib"]  # cdylib for Flutter FFI
+
+[dependencies]
+x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+pqcrypto-kyber = { workspace = true }
+pqcrypto-traits = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = "0.4"
+criterion = "0.5"
+
+[[bench]]
+name = "ratchet_bench"
+harness = false

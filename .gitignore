@@ -1,0 +1,31 @@
+# Build artifacts
+target/
+dist/
+
+# Environment and secrets
+.env.production
+deploy/.env.production
+*.jks
+transparency_signing.key
+
+# Tauri codegen
+echo-app/src-tauri/gen/
+
+# Flutter client (dead code, replaced by Tauri desktop)
+client/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Empty dirs
+docs/

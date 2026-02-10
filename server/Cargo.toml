@@ -1,0 +1,45 @@
+[package]
+name = "echo-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ECHO Messenger server - zero-knowledge message relay"
+
+[[bin]]
+name = "echo-server"
+path = "src/main.rs"
+
+[dependencies]
+echo-crypto = { path = "../shared" }
+tokio = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "limit"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+redis = { version = "0.27", features = ["tokio-comp"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+dotenvy = "0.15"
+config = "0.14"
+hex = "0.4"
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+bincode = { workspace = true }
+argon2 = "0.5"
+aes-gcm = { workspace = true }
+
+# Optional TLS
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+default = []
+tls = ["axum-server", "rustls-pemfile"]

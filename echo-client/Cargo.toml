@@ -1,0 +1,32 @@
+[package]
+name = "echo-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared client library for ECHO Messenger (CLI + Tauri)"
+
+[lib]
+name = "echo_client"
+
+[dependencies]
+echo-crypto = { path = "../shared" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+hex = "0.4"
+sha2 = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+argon2 = "0.5"
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+ed25519-dalek = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
