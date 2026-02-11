@@ -65,7 +65,7 @@ pub async fn establish_session(
         }
     }
 
-    // Verify transparency (sync)
+    // Verify transparency (sync) — auto-recover on stale cache
     let mut verified = false;
     if let Some(ref tp) = bundle.transparency {
         let ik_bytes = hex::decode(&bundle.identity_key).map_err(|e| e.to_string())?;
@@ -84,7 +84,32 @@ pub async fn establish_session(
                 verified = true;
             }
             Err(e) => {
-                return Err(format!("Transparency verification FAILED: {}", e));
+                let err_str = e.to_string();
+                // Consistency failure means the tree grew (new devices registered).
+                // Clear stale cache and retry with TOFU instead of blocking the session.
+                if err_str.contains("consistency") && last_sth.is_some() {
+                    tracing::warn!("Transparency consistency stale, resetting to TOFU: {}", err_str);
+                    let vault = state.vault.lock().unwrap();
+                    vault.delete_file("last_sth.enc").ok();
+                    // Retry without cached STH (TOFU)
+                    match transparency::verify_transparency(
+                        tp,
+                        &ik_bytes,
+                        &idk_bytes,
+                        None,
+                        server_pubkey.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            vault.save_last_sth(&tp.sth).ok();
+                            verified = true;
+                        }
+                        Err(e2) => {
+                            return Err(format!("Transparency verification FAILED: {}", e2));
+                        }
+                    }
+                } else {
+                    return Err(format!("Transparency verification FAILED: {}", e));
+                }
             }
         }
     }

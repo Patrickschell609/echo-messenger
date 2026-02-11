@@ -355,17 +355,23 @@ const Chat = {
     } catch (e) {
       this.establishing = false;
       const msg = typeof e === 'string' ? e : e.message || 'Session failed';
+      console.error('[ECHO] establish_session failed:', msg, e);
 
       // Remove the pulsing "establishing" message
       const est = document.querySelector('.establishing-msg');
       if (est) est.remove();
 
-      // Show failure with retry button
+      // Show specific error with retry button
+      let userMsg = 'Could not connect';
+      if (msg.includes('Transparency')) userMsg = 'Key verification failed';
+      else if (msg.includes('Not signed in') || msg.includes('Not connected')) userMsg = 'Not signed in';
+      else if (msg.includes('fetch') || msg.includes('network') || msg.includes('timeout')) userMsg = 'Network error';
+
       const container = document.getElementById('chatMessages');
       if (container) {
         const div = document.createElement('div');
         div.className = 'message-system';
-        div.innerHTML = `Could not connect. <span class="retry-link" id="retrySession">Try again</span>`;
+        div.innerHTML = `${esc(userMsg)}. <span class="retry-link" id="retrySession">Try again</span>`;
         container.appendChild(div);
 
         document.getElementById('retrySession').addEventListener('click', () => {

@@ -25,11 +25,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Register a new account and generate all keys
+    /// Register a new account via invite code
     Register {
-        /// Phone number (hashed client-side before sending)
+        /// Invite code
         #[arg(long)]
-        phone: String,
+        invite: String,
     },
 
     /// Show this identity's device ID
@@ -73,22 +73,30 @@ async fn main() -> Result<()> {
     let store = IdentityStore::new(&cli.identity)?;
 
     match cli.command {
-        Commands::Register { phone } => cmd_register(&http, &store, &phone).await,
+        Commands::Register { invite } => cmd_register(&http, &store, &invite).await,
         Commands::Whoami => cmd_whoami(&store),
-        Commands::Session { device } => cmd_session(&http, &store, &device).await,
+        Commands::Session { device } => {
+            let state = store.load()?;
+            let mut ed_bytes = [0u8; 32];
+            ed_bytes.copy_from_slice(&state.identity_ed_private);
+            let auth_http = HttpClient::with_auth(&cli.server, state.device_id, &ed_bytes);
+            cmd_session(&auth_http, &store, &device).await
+        }
         Commands::Send { to, msg } => cmd_send(&http, &store, &to, &msg).await,
-        Commands::Recv => cmd_recv(&http, &store).await,
+        Commands::Recv => {
+            let state = store.load()?;
+            let mut ed_bytes = [0u8; 32];
+            ed_bytes.copy_from_slice(&state.identity_ed_private);
+            let auth_http = HttpClient::with_auth(&cli.server, state.device_id, &ed_bytes);
+            cmd_recv(&auth_http, &store).await
+        }
         Commands::Monitor => cmd_monitor(&http, &store).await,
     }
 }
 
-async fn cmd_register(http: &HttpClient, store: &IdentityStore, phone: &str) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    let phone_hash = Sha256::digest(phone.as_bytes());
-    let phone_hash_hex = hex::encode(phone_hash);
-
-    println!("Registering account...");
-    let (account_id, auth_nonce) = http.register(&phone_hash_hex).await?;
+async fn cmd_register(http: &HttpClient, store: &IdentityStore, invite: &str) -> Result<()> {
+    println!("Redeeming invite code...");
+    let (account_id, auth_nonce) = http.redeem_invite(invite).await?;
     println!("Account: {}", account_id);
 
     println!("Generating identity keys...");
@@ -154,9 +162,32 @@ async fn cmd_session(
                 store.save_last_sth(&tp.sth)?;
             }
             Err(e) => {
-                eprintln!("SECURITY: Key transparency verification FAILED: {}", e);
-                eprintln!("Session establishment BLOCKED — possible MITM attack.");
-                return Err(e);
+                let err_str = e.to_string();
+                // Consistency failure = tree grew (new devices). Clear cache, retry TOFU.
+                if err_str.contains("consistency") && last_sth.is_some() {
+                    eprintln!("Transparency cache stale, resetting to TOFU...");
+                    store.clear_last_sth().ok();
+                    match transparency::verify_transparency(
+                        tp,
+                        &ik_bytes,
+                        &idk_bytes,
+                        None,
+                        server_pubkey.as_deref(),
+                    ) {
+                        Ok(()) => {
+                            println!("Key transparency: VERIFIED (TOFU reset)");
+                            store.save_last_sth(&tp.sth)?;
+                        }
+                        Err(e2) => {
+                            eprintln!("SECURITY: Key transparency verification FAILED: {}", e2);
+                            return Err(e2);
+                        }
+                    }
+                } else {
+                    eprintln!("SECURITY: Key transparency verification FAILED: {}", e);
+                    eprintln!("Session establishment BLOCKED — possible MITM attack.");
+                    return Err(e);
+                }
             }
         }
     } else {

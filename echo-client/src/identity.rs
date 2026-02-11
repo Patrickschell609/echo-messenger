@@ -392,6 +392,14 @@ impl IdentityStore {
         serde_json::from_str(&json).ok()
     }
 
+    pub fn clear_last_sth(&self) -> Result<()> {
+        let path = self.dir.join("last_sth.json");
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
     pub fn save_server_transparency_key(&self, pubkey_hex: &str) -> Result<()> {
         std::fs::write(self.dir.join("server_transparency_key.hex"), pubkey_hex)?;
         Ok(())
