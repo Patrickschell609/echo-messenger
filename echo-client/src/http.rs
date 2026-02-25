@@ -1,6 +1,7 @@
 //! HTTP client for talking to the ECHO server.
 
 use anyhow::{anyhow, Result};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,10 +20,18 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
+    fn build_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .user_agent("ECHO/1.0")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client")
+    }
+
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: Self::build_client(),
             auth: None,
         }
     }
@@ -32,7 +41,7 @@ impl HttpClient {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(ed25519_private);
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: Self::build_client(),
             auth: Some(AuthCredentials {
                 device_id,
                 signing_key,
@@ -44,12 +53,14 @@ impl HttpClient {
         &self.base_url
     }
 
-    /// Sign a request with Ed25519: device_id || timestamp || method || path
+    /// Sign a request with Ed25519: device_id || timestamp || nonce || method || path || body_hash
+    /// Includes a random nonce to prevent replay and SHA-256 hash of request body to prevent tampering.
     fn sign_request(
         &self,
         method: &str,
         path: &str,
-    ) -> Option<(String, String, String)> {
+        body: Option<&[u8]>,
+    ) -> Option<(String, String, String, String)> {
         let auth = self.auth.as_ref()?;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -58,17 +69,29 @@ impl HttpClient {
         let timestamp_str = timestamp.to_string();
         let device_id_str = auth.device_id.to_string();
 
+        // Generate random 16-byte nonce to prevent replay attacks
+        let mut nonce_bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce_hex = hex::encode(nonce_bytes);
+
+        // Hash the request body (empty hash for GET/no body)
+        use sha2::{Sha256, Digest};
+        let body_hash = Sha256::digest(body.unwrap_or(&[]));
+        let body_hash_hex = hex::encode(body_hash);
+
         let mut message = Vec::new();
         message.extend_from_slice(device_id_str.as_bytes());
         message.extend_from_slice(timestamp_str.as_bytes());
+        message.extend_from_slice(nonce_hex.as_bytes());
         message.extend_from_slice(method.as_bytes());
         message.extend_from_slice(path.as_bytes());
+        message.extend_from_slice(body_hash_hex.as_bytes());
 
         use ed25519_dalek::Signer;
         let signature = auth.signing_key.sign(&message);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        Some((device_id_str, timestamp_str, sig_hex))
+        Some((device_id_str, timestamp_str, nonce_hex, sig_hex))
     }
 
     /// Add auth headers to a request builder if credentials are available.
@@ -77,11 +100,13 @@ impl HttpClient {
         mut req: reqwest::RequestBuilder,
         method: &str,
         path: &str,
+        body: Option<&[u8]>,
     ) -> reqwest::RequestBuilder {
-        if let Some((device_id, timestamp, signature)) = self.sign_request(method, path) {
+        if let Some((device_id, timestamp, nonce, signature)) = self.sign_request(method, path, body) {
             req = req
                 .header("x-device-id", device_id)
                 .header("x-auth-timestamp", timestamp)
+                .header("x-auth-nonce", nonce)
                 .header("x-auth-signature", signature);
         }
         req
@@ -104,7 +129,7 @@ impl HttpClient {
             .post(format!("{}{}", self.base_url, path))
             .json(&Req { count });
 
-        req = self.add_auth_headers(req, "POST", path);
+        req = self.add_auth_headers(req, "POST", path, None);
 
         let resp = req.send().await?;
 
@@ -158,7 +183,7 @@ impl HttpClient {
 
         let path = "/v1/keys/prekey-count";
         let mut req = self.client.get(format!("{}{}", self.base_url, path));
-        req = self.add_auth_headers(req, "GET", path);
+        req = self.add_auth_headers(req, "GET", path, None);
 
         let resp = req.send().await?;
 
@@ -200,7 +225,7 @@ impl HttpClient {
                 one_time_prekeys: otpks,
             });
 
-        req = self.add_auth_headers(req, "POST", path);
+        req = self.add_auth_headers(req, "POST", path, None);
 
         let resp = req.send().await?;
 
@@ -245,13 +270,13 @@ impl HttpClient {
     }
 
     /// POST /v1/keys/upload — requires auth_nonce (for new device) + Ed25519 signature
-    /// Returns (device_id, optional sender_cert_bytes)
+    /// Returns (device_id, optional sender_cert_bytes, optional short_code)
     pub async fn upload_prekeys(
         &self,
         account_id: Uuid,
         keys: &KeyMaterial,
         auth_nonce: Option<&str>,
-    ) -> Result<(Uuid, Option<Vec<u8>>)> {
+    ) -> Result<(Uuid, Option<Vec<u8>>, Option<String>)> {
         #[derive(Serialize)]
         struct OtpkReq {
             key_id: i32,
@@ -262,6 +287,8 @@ impl HttpClient {
             account_id: Uuid,
             identity_key: String,
             identity_dh_key: String,
+            /// C3: Ed25519 signature binding identity_dh_key to identity_key
+            identity_dh_key_sig: Option<String>,
             signed_prekey: String,
             signed_prekey_sig: String,
             signed_prekey_id: i32,
@@ -276,6 +303,7 @@ impl HttpClient {
         struct Resp {
             device_id: Uuid,
             sender_cert: Option<String>,
+            short_code: Option<String>,
         }
 
         let otpks: Vec<OtpkReq> = keys
@@ -299,10 +327,18 @@ impl HttpClient {
         let sig = signing_key.sign(&sign_msg);
         let auth_signature = hex::encode(sig.to_bytes());
 
+        // C3: Sign identity_dh_key with Ed25519 to bind it to identity
+        let mut dh_bind_msg = Vec::new();
+        dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
+        dh_bind_msg.extend_from_slice(&keys.identity_dh.public_key().0);
+        let dh_sig = signing_key.sign(&dh_bind_msg);
+        let identity_dh_key_sig = hex::encode(dh_sig.to_bytes());
+
         let req = Req {
             account_id,
             identity_key: hex::encode(&identity_key_bytes),
             identity_dh_key: hex::encode(&keys.identity_dh.public_key().0),
+            identity_dh_key_sig: Some(identity_dh_key_sig),
             signed_prekey: hex::encode(&keys.signed_prekey.public_key().0),
             signed_prekey_sig: hex::encode(&keys.signed_prekey_sig),
             signed_prekey_id: keys.signed_prekey_id as i32,
@@ -332,7 +368,7 @@ impl HttpClient {
             .map(|h| hex::decode(h))
             .transpose()
             .map_err(|_| anyhow!("invalid sender_cert hex in response"))?;
-        Ok((data.device_id, cert_bytes))
+        Ok((data.device_id, cert_bytes, data.short_code))
     }
 
     /// GET /v1/keys/:device_id (authenticated)
@@ -349,7 +385,7 @@ impl HttpClient {
 
         // Add auth headers if available, otherwise fall back to plain header
         if self.auth.is_some() {
-            req = self.add_auth_headers(req, "GET", &path);
+            req = self.add_auth_headers(req, "GET", &path, None);
         } else {
             req = req.header("x-device-id", our_device_id.to_string());
         }
@@ -435,7 +471,7 @@ impl HttpClient {
                 bio: bio.map(|s| s.to_string()),
             });
 
-        req = self.add_auth_headers(req, "POST", path);
+        req = self.add_auth_headers(req, "POST", path, None);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -452,7 +488,7 @@ impl HttpClient {
     pub async fn fetch_profile(&self, target_device_id: Uuid) -> Result<ProfileResponse> {
         let path = format!("/v1/profile/{}", target_device_id);
         let mut req = self.client.get(format!("{}{}", self.base_url, path));
-        req = self.add_auth_headers(req, "GET", &path);
+        req = self.add_auth_headers(req, "GET", &path, None);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -462,6 +498,24 @@ impl HttpClient {
         }
 
         let data: ProfileResponse = resp.json().await?;
+        Ok(data)
+    }
+
+    /// GET /v1/lookup/{code} (authenticated) — resolve a short code to a device
+    pub async fn lookup_by_code(&self, code: &str) -> Result<LookupResponse> {
+        let normalized = code.replace('-', "").to_uppercase();
+        let path = format!("/v1/lookup/{}", normalized);
+        let mut req = self.client.get(format!("{}{}", self.base_url, path));
+        req = self.add_auth_headers(req, "GET", &path, None);
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("lookup_by_code failed ({}): {}", status, body));
+        }
+
+        let data: LookupResponse = resp.json().await?;
         Ok(data)
     }
 
@@ -505,7 +559,7 @@ impl HttpClient {
             .get(format!("{}{}", self.base_url, path));
 
         if self.auth.is_some() {
-            req = self.add_auth_headers(req, "GET", path);
+            req = self.add_auth_headers(req, "GET", path, None);
         } else {
             req = req.header("x-device-id", device_id.to_string());
         }
@@ -538,7 +592,7 @@ impl HttpClient {
             });
 
         if self.auth.is_some() {
-            req = self.add_auth_headers(req, "POST", path);
+            req = self.add_auth_headers(req, "POST", path, None);
         } else {
             req = req.header("x-device-id", device_id.to_string());
         }
@@ -560,6 +614,9 @@ impl HttpClient {
 pub struct PrekeyBundleResponse {
     pub identity_key: String,
     pub identity_dh_key: String,
+    /// C3: Ed25519 signature binding identity_dh_key to identity_key (hex)
+    #[serde(default)]
+    pub identity_dh_key_sig: Option<String>,
     pub signed_prekey: String,
     pub signed_prekey_sig: String,
     pub signed_prekey_id: i32,
@@ -608,9 +665,16 @@ impl PrekeyBundleResponse {
             echo_crypto::PublicKey(arr)
         });
 
+        // C3: Decode identity_dh_key binding signature
+        let identity_dh_key_sig = self.identity_dh_key_sig.as_ref()
+            .map(|h| hex::decode(h))
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(echo_crypto::PrekeyBundle {
             identity_key: echo_crypto::IdentityPublicKey(ik),
             identity_dh_key: echo_crypto::PublicKey(idk),
+            identity_dh_key_signature: identity_dh_key_sig,
             signed_prekey: echo_crypto::PublicKey(spk),
             signed_prekey_signature: signed_prekey_sig,
             signed_prekey_id: self.signed_prekey_id as u32,
@@ -636,6 +700,14 @@ pub struct ProfileResponse {
     pub device_id: String,
     pub display_name: Option<String>,
     pub bio: Option<String>,
+}
+
+/// Response from /v1/lookup/{code}.
+#[derive(Deserialize, Clone, Serialize)]
+pub struct LookupResponse {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub short_code: String,
 }
 
 /// Response from /v1/transparency/sth
@@ -689,7 +761,7 @@ impl HttpClient {
                 name: name.to_string(),
                 member_device_ids: member_device_ids.to_vec(),
             });
-        req = self.add_auth_headers(req, "POST", path);
+        req = self.add_auth_headers(req, "POST", path, None);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -705,7 +777,7 @@ impl HttpClient {
     pub async fn list_groups(&self) -> Result<Vec<GroupResponse>> {
         let path = "/v1/groups";
         let mut req = self.client.get(format!("{}{}", self.base_url, path));
-        req = self.add_auth_headers(req, "GET", path);
+        req = self.add_auth_headers(req, "GET", path, None);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -735,7 +807,7 @@ impl HttpClient {
             .json(&Req {
                 payload: hex::encode(payload),
             });
-        req = self.add_auth_headers(req, "POST", &path);
+        req = self.add_auth_headers(req, "POST", &path, None);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -751,7 +823,7 @@ impl HttpClient {
     pub async fn receive_group_messages(&self, group_id: Uuid) -> Result<Vec<GroupQueuedMessage>> {
         let path = format!("/v1/groups/{}/messages", group_id);
         let mut req = self.client.get(format!("{}{}", self.base_url, path));
-        req = self.add_auth_headers(req, "GET", &path);
+        req = self.add_auth_headers(req, "GET", &path, None);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -767,7 +839,7 @@ impl HttpClient {
     pub async fn get_group_members(&self, group_id: Uuid) -> Result<Vec<GroupMemberInfo>> {
         let path = format!("/v1/groups/{}/members", group_id);
         let mut req = self.client.get(format!("{}{}", self.base_url, path));
-        req = self.add_auth_headers(req, "GET", &path);
+        req = self.add_auth_headers(req, "GET", &path, None);
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -783,7 +855,7 @@ impl HttpClient {
     pub async fn leave_group(&self, group_id: Uuid) -> Result<()> {
         let path = format!("/v1/groups/{}/leave", group_id);
         let mut req = self.client.post(format!("{}{}", self.base_url, path));
-        req = self.add_auth_headers(req, "POST", &path);
+        req = self.add_auth_headers(req, "POST", &path, None);
 
         let resp = req.send().await?;
         let status = resp.status();

@@ -22,12 +22,19 @@ pub struct SenderCertificate {
     pub sender_device_id: DeviceId,
     pub expiry: u64,
     pub server_signature: Vec<u8>, // Server signs to prevent spoofing
+    /// Sender counter-signature: Ed25519 sign over (device_id || identity || expiry || server_sig).
+    /// Prevents a compromised server from forging certs for arbitrary identities.
+    #[serde(default)]
+    pub sender_signature: Vec<u8>,
 }
 
-/// Verify a sender certificate's server signature.
+/// Verify a sender certificate's server signature AND sender counter-signature.
 ///
 /// The server signs: device_id_bytes || identity_key_bytes || expiry_le_bytes
 /// using its Ed25519 transparency key.
+///
+/// The sender counter-signs: "echo-sender-cert-v1:" || device_id || identity_key || expiry || server_signature
+/// using their Ed25519 identity key. This prevents a compromised server from forging certs.
 pub fn verify_sender_cert(
     cert: &SenderCertificate,
     server_pubkey: &[u8; 32],
@@ -47,6 +54,7 @@ pub fn verify_sender_cert(
         return Err(EchoError::SealedSenderFailed);
     }
 
+    // --- Verify server signature ---
     // Reconstruct the signed message: device_id || identity_key || expiry
     let mut msg = Vec::new();
     msg.extend_from_slice(&cert.sender_device_id.0);
@@ -63,7 +71,50 @@ pub fn verify_sender_cert(
     vk.verify(&msg, &sig)
         .map_err(|_| EchoError::SealedSenderFailed)?;
 
+    // --- Verify sender counter-signature (C1: prevents server forgery) ---
+    if cert.sender_signature.len() != 64 {
+        return Err(EchoError::SealedSenderFailed);
+    }
+
+    let mut sender_msg = Vec::new();
+    sender_msg.extend_from_slice(b"echo-sender-cert-v1:");
+    sender_msg.extend_from_slice(&cert.sender_device_id.0);
+    sender_msg.extend_from_slice(&cert.sender_identity.0);
+    sender_msg.extend_from_slice(&cert.expiry.to_le_bytes());
+    sender_msg.extend_from_slice(&cert.server_signature);
+
+    let sender_vk = VerifyingKey::from_bytes(&cert.sender_identity.0)
+        .map_err(|_| EchoError::SealedSenderFailed)?;
+
+    let mut sender_sig_arr = [0u8; 64];
+    sender_sig_arr.copy_from_slice(&cert.sender_signature);
+    let sender_sig = Signature::from_bytes(&sender_sig_arr);
+
+    sender_vk.verify(&sender_msg, &sender_sig)
+        .map_err(|_| EchoError::SealedSenderFailed)?;
+
     Ok(())
+}
+
+/// Counter-sign a server-signed sender certificate with the sender's Ed25519 identity key.
+/// Must be called after receiving the cert from the server and before using it.
+pub fn countersign_sender_cert(
+    cert: &mut SenderCertificate,
+    sender_ed25519_private: &[u8; 32],
+) {
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::Signer;
+
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"echo-sender-cert-v1:");
+    msg.extend_from_slice(&cert.sender_device_id.0);
+    msg.extend_from_slice(&cert.sender_identity.0);
+    msg.extend_from_slice(&cert.expiry.to_le_bytes());
+    msg.extend_from_slice(&cert.server_signature);
+
+    let sk = SigningKey::from_bytes(sender_ed25519_private);
+    let sig = sk.sign(&msg);
+    cert.sender_signature = sig.to_bytes().to_vec();
 }
 
 /// Seal a message (sender side).
@@ -108,12 +159,12 @@ pub fn seal_message(
 const MAX_CERT_LEN: usize = 4096;
 
 /// Unseal a message (recipient side).
-/// When `server_pubkey` is provided, the sender certificate signature and expiry are verified.
+/// Server pubkey is REQUIRED -- sender certificate signature and expiry are always verified (H1).
 /// Returns (sender_certificate, tr3_ciphertext).
 pub fn unseal_message(
     our_identity_dh: &X25519KeyPair,
     envelope: &SealedEnvelope,
-    server_pubkey: Option<&[u8; 32]>,
+    server_pubkey: &[u8; 32],
 ) -> Result<(SenderCertificate, Vec<u8>)> {
     // DH with ephemeral key
     let dh_output = our_identity_dh.dh(&envelope.ephemeral_public)?;
@@ -149,10 +200,8 @@ pub fn unseal_message(
     let cert: SenderCertificate = bincode::deserialize(&payload[4..cert_end])
         .map_err(|_| EchoError::SealedSenderFailed)?;
 
-    // Mandatory cert verification when server pubkey is available
-    if let Some(pubkey) = server_pubkey {
-        verify_sender_cert(&cert, pubkey)?;
-    }
+    // Always verify sender cert (H1: server_pubkey is now mandatory)
+    verify_sender_cert(&cert, server_pubkey)?;
 
     let tr3_ciphertext = payload[cert_end..].to_vec();
 

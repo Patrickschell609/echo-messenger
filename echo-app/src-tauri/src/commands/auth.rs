@@ -1,4 +1,5 @@
 use tauri::{AppHandle, Emitter, Manager};
+use zeroize::Zeroize;
 
 use echo_client::history::EncryptedHistory;
 use echo_client::http::HttpClient;
@@ -13,6 +14,7 @@ use crate::state::AppState;
 pub struct SignOnResult {
     pub device_id: String,
     pub account_id: String,
+    pub short_code: Option<String>,
 }
 
 /// Create a new account on the server via invite code, generate keys, save to vault.
@@ -35,8 +37,9 @@ pub async fn create_account(
     // Generate keys
     let keys = KeyMaterial::generate();
 
-    // Upload prekeys with auth nonce + signature — returns device_id + signed sender cert
-    let (device_id, sender_cert_bytes) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await.map_err(|e| e.to_string())?;
+    // Upload prekeys with auth nonce + signature — returns device_id + signed sender cert + short code
+    let (device_id, sender_cert_bytes, short_code) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await.map_err(|e| e.to_string())?;
+    let short_code_for_result = short_code.clone();
 
     // Build identity state directly (no plaintext IdentityStore)
     let identity_state = echo_client::identity::IdentityState {
@@ -63,10 +66,11 @@ pub async fn create_account(
         prev_pq_sk: None,
         prev_pq_prekey_id: None,
         prev_key_expiry: None,
+        short_code,
     };
 
     // Initialize encrypted vault
-    let vault_path = EncryptedVault::default_path().map_err(|e| e.to_string())?;
+    let vault_path = crate::state::vault_path().map_err(|e| e.to_string())?;
     let mut vault = EncryptedVault::new(&vault_path);
     vault.create(&passphrase).map_err(|e| e.to_string())?;
 
@@ -77,9 +81,13 @@ pub async fn create_account(
     let contacts: Vec<crate::state::Contact> = Vec::new();
     vault.write_file("contacts.enc", &contacts).map_err(|e| e.to_string())?;
 
-    // Save server-signed sender certificate if provided
+    // Save server-signed sender certificate if provided, counter-signing with our Ed25519 key (C1)
     if let Some(cert_bytes) = sender_cert_bytes {
-        if let Ok(cert) = bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
+        if let Ok(mut cert) = bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
+            let mut ed_priv = [0u8; 32];
+            ed_priv.copy_from_slice(&identity_state.identity_ed_private);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+            ed_priv.zeroize();
             vault.save_sender_cert(&cert).map_err(|e| e.to_string())?;
         }
     }
@@ -89,9 +97,10 @@ pub async fn create_account(
     let db_path = vault.vault_dir().join("history.db");
     let history = EncryptedHistory::open(&db_path, history_key).map_err(|e| e.to_string())?;
 
-    // Init outbox
+    // Init encrypted outbox
+    let outbox_key = vault.derive_sub_key("outbox").map_err(|e| e.to_string())?;
     let outbox_path = vault.vault_dir().join("outbox.db");
-    let outbox = OutboxQueue::open(&outbox_path).map_err(|e| e.to_string())?;
+    let outbox = OutboxQueue::open_encrypted(&outbox_path, outbox_key).map_err(|e| e.to_string())?;
 
     // Build authenticated HTTP client
     let mut ed_bytes = [0u8; 32];
@@ -109,6 +118,7 @@ pub async fn create_account(
     let result = SignOnResult {
         device_id: device_id.to_string(),
         account_id: account_id.to_string(),
+        short_code: short_code_for_result,
     };
 
     app.emit(events::EVENT_SIGNED_IN, &result).ok();
@@ -128,7 +138,7 @@ pub async fn sign_on(
     *state.server_url.lock().unwrap() = server_url.clone();
 
     // Unlock vault
-    let vault_path = EncryptedVault::default_path().map_err(|e| e.to_string())?;
+    let vault_path = crate::state::vault_path().map_err(|e| e.to_string())?;
     let mut vault = EncryptedVault::new(&vault_path);
     vault.unlock(&passphrase).map_err(|_| "Wrong passphrase or no account found".to_string())?;
 
@@ -148,14 +158,17 @@ pub async fn sign_on(
     let db_path = vault.vault_dir().join("history.db");
     let history = EncryptedHistory::open(&db_path, history_key).map_err(|e| e.to_string())?;
 
-    // Init outbox
+    // Init encrypted outbox
+    let outbox_key = vault.derive_sub_key("outbox").map_err(|e| e.to_string())?;
     let outbox_path = vault.vault_dir().join("outbox.db");
-    let outbox = OutboxQueue::open(&outbox_path).map_err(|e| e.to_string())?;
+    let outbox = OutboxQueue::open_encrypted(&outbox_path, outbox_key).map_err(|e| e.to_string())?;
 
     // Build authenticated HTTP client
     let mut ed_bytes = [0u8; 32];
     ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
     let auth_http = HttpClient::with_auth(&server_url, device_id, &ed_bytes);
+
+    let short_code = identity_state.short_code.clone();
 
     // Update state
     *state.http.lock().unwrap() = Some(auth_http);
@@ -168,6 +181,7 @@ pub async fn sign_on(
     let result = SignOnResult {
         device_id: device_id.to_string(),
         account_id: account_id.to_string(),
+        short_code,
     };
 
     app.emit(events::EVENT_SIGNED_IN, &result).ok();
@@ -179,6 +193,12 @@ pub async fn sign_on(
 #[tauri::command]
 pub async fn sign_off(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+
+    // Clean up unencrypted media files
+    let media_dir = crate::commands::messaging::media_dir();
+    if media_dir.exists() {
+        std::fs::remove_dir_all(&media_dir).ok();
+    }
 
     *state.signed_in.lock().unwrap() = false;
     *state.identity.lock().unwrap() = None;
@@ -196,7 +216,7 @@ pub async fn sign_off(app: AppHandle) -> Result<(), String> {
 /// Check if a vault already exists (for showing Sign On vs Create Account).
 #[tauri::command]
 pub fn vault_exists() -> bool {
-    EncryptedVault::default_path()
+    crate::state::vault_path()
         .map(|p| p.join("salt.bin").exists())
         .unwrap_or(false)
 }

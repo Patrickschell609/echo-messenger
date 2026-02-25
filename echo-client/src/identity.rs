@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use echo_crypto::crypto::ed25519::Ed25519KeyPair;
 use echo_crypto::crypto::kdf;
@@ -131,6 +132,31 @@ pub struct IdentityState {
     /// Expiry timestamp for previous keys (unix seconds)
     #[serde(default)]
     pub prev_key_expiry: Option<u64>,
+    /// Human-friendly short code (e.g. "A7X2-KM9P")
+    #[serde(default)]
+    pub short_code: Option<String>,
+}
+
+impl Drop for IdentityState {
+    fn drop(&mut self) {
+        self.identity_ed_private.zeroize();
+        self.identity_ed_public.zeroize();
+        self.identity_dh_private.zeroize();
+        self.identity_dh_public.zeroize();
+        self.signed_prekey_private.zeroize();
+        self.signed_prekey_public.zeroize();
+        self.pq_pk.zeroize();
+        self.pq_sk.zeroize();
+        for (_, key_bytes) in &mut self.one_time_prekeys {
+            key_bytes.zeroize();
+        }
+        if let Some(ref mut key) = self.prev_signed_prekey_private {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.prev_pq_sk {
+            key.zeroize();
+        }
+    }
 }
 
 impl IdentityState {
@@ -193,15 +219,17 @@ fn default_true() -> bool {
     true
 }
 
-// ─── Identity store ───
+// ─── Identity store (encrypted via EncryptedVault) ───
 
 pub struct IdentityStore {
     name: String,
     dir: PathBuf,
+    vault: crate::storage::EncryptedVault,
 }
 
 impl IdentityStore {
-    /// Create a store under ~/.echo/<name>/
+    /// Create a store under ~/.echo/<name>/ with vault encryption.
+    /// Passphrase is required: set ECHO_PASSPHRASE env var, or pass directly.
     pub fn new(name: &str) -> Result<Self> {
         let base = dirs::home_dir()
             .ok_or_else(|| anyhow!("cannot determine home directory"))?
@@ -213,10 +241,36 @@ impl IdentityStore {
     pub fn with_base_dir(name: &str, base: &Path) -> Result<Self> {
         let dir = base.join(name);
         std::fs::create_dir_all(&dir)?;
-        Ok(Self {
-            name: name.to_string(),
-            dir,
-        })
+        let vault_dir = dir.join("vault");
+        let mut vault = crate::storage::EncryptedVault::new(&vault_dir);
+
+        // Prompt for passphrase — never read from env vars (leaked via /proc/pid/environ)
+        eprint!("Vault passphrase: ");
+        let mut passphrase = String::new();
+        std::io::stdin().read_line(&mut passphrase).unwrap_or_default();
+        let passphrase = passphrase.trim().to_string();
+
+        if vault_dir.join("salt.bin").exists() {
+            vault.unlock(&passphrase)?;
+        } else {
+            vault.create(&passphrase)?;
+        }
+
+        // Migrate legacy plaintext identity.json if it exists
+        let legacy_path = dir.join("identity.json");
+        if legacy_path.exists() && !vault_dir.join("identity.enc").exists() {
+            eprintln!("[ECHO] Migrating plaintext identity to encrypted vault...");
+            let json = std::fs::read_to_string(&legacy_path)?;
+            let state: IdentityState = serde_json::from_str(&json)?;
+            vault.write_file("identity.enc", &state)?;
+            // Shred legacy file: overwrite with zeros then delete
+            let len = std::fs::metadata(&legacy_path)?.len() as usize;
+            std::fs::write(&legacy_path, vec![0u8; len])?;
+            std::fs::remove_file(&legacy_path)?;
+            eprintln!("[ECHO] Migration complete. Plaintext identity deleted.");
+        }
+
+        Ok(Self { name: name.to_string(), dir, vault })
     }
 
     pub fn name(&self) -> &str {
@@ -252,18 +306,16 @@ impl IdentityStore {
             prev_pq_sk: None,
             prev_pq_prekey_id: None,
             prev_key_expiry: None,
+            short_code: None,
         };
 
-        let json = serde_json::to_string_pretty(&state)?;
-        std::fs::write(self.dir.join("identity.json"), json)?;
+        self.vault.write_file("identity.enc", &state)?;
         Ok(())
     }
 
     pub fn load(&self) -> Result<IdentityState> {
-        let json = std::fs::read_to_string(self.dir.join("identity.json"))
-            .map_err(|_| anyhow!("identity not found — run `echo register` first"))?;
-        let state: IdentityState = serde_json::from_str(&json)?;
-        Ok(state)
+        self.vault.read_file::<IdentityState>("identity.enc")
+            .map_err(|_| anyhow!("identity not found — run `echo register` first"))
     }
 
     pub fn save_session(
@@ -273,14 +325,8 @@ impl IdentityStore {
         init_result: &X4DHInitResult,
         recipient_dh_key: &PublicKey,
     ) -> Result<()> {
-        let sessions_dir = self.dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir)?;
-
-        let ratchet_json = serde_json::to_string_pretty(ratchet_state)?;
-        std::fs::write(
-            sessions_dir.join(format!("{}.ratchet.json", recipient_device_id)),
-            ratchet_json,
-        )?;
+        let ratchet_path = format!("sessions/{}.ratchet.enc", recipient_device_id);
+        self.vault.write_file(&ratchet_path, ratchet_state)?;
 
         let meta = SessionMeta {
             recipient_device_id,
@@ -291,11 +337,8 @@ impl IdentityStore {
             used_one_time_prekey_id: init_result.used_one_time_prekey_id,
             needs_prekey_message: true,
         };
-        let meta_json = serde_json::to_string_pretty(&meta)?;
-        std::fs::write(
-            sessions_dir.join(format!("{}.meta.json", recipient_device_id)),
-            meta_json,
-        )?;
+        let meta_path = format!("sessions/{}.meta.enc", recipient_device_id);
+        self.vault.write_file(&meta_path, &meta)?;
 
         Ok(())
     }
@@ -306,39 +349,23 @@ impl IdentityStore {
         ratchet_state: &RatchetState,
         meta: &SessionMeta,
     ) -> Result<()> {
-        let sessions_dir = self.dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir)?;
+        let ratchet_path = format!("sessions/{}.ratchet.enc", recipient_device_id);
+        self.vault.write_file(&ratchet_path, ratchet_state)?;
 
-        let ratchet_json = serde_json::to_string_pretty(ratchet_state)?;
-        std::fs::write(
-            sessions_dir.join(format!("{}.ratchet.json", recipient_device_id)),
-            ratchet_json,
-        )?;
-
-        let meta_json = serde_json::to_string_pretty(meta)?;
-        std::fs::write(
-            sessions_dir.join(format!("{}.meta.json", recipient_device_id)),
-            meta_json,
-        )?;
+        let meta_path = format!("sessions/{}.meta.enc", recipient_device_id);
+        self.vault.write_file(&meta_path, meta)?;
 
         Ok(())
     }
 
     pub fn load_session(&self, recipient_device_id: Uuid) -> Result<(RatchetState, SessionMeta)> {
-        let sessions_dir = self.dir.join("sessions");
+        let ratchet_path = format!("sessions/{}.ratchet.enc", recipient_device_id);
+        let ratchet_state: RatchetState = self.vault.read_file(&ratchet_path)
+            .map_err(|_| anyhow!("no session for device {}", recipient_device_id))?;
 
-        let ratchet_json = std::fs::read_to_string(
-            sessions_dir.join(format!("{}.ratchet.json", recipient_device_id)),
-        )
-        .map_err(|_| anyhow!("no session for device {}", recipient_device_id))?;
-
-        let meta_json = std::fs::read_to_string(
-            sessions_dir.join(format!("{}.meta.json", recipient_device_id)),
-        )
-        .map_err(|_| anyhow!("no session meta for device {}", recipient_device_id))?;
-
-        let ratchet_state: RatchetState = serde_json::from_str(&ratchet_json)?;
-        let meta: SessionMeta = serde_json::from_str(&meta_json)?;
+        let meta_path = format!("sessions/{}.meta.enc", recipient_device_id);
+        let meta: SessionMeta = self.vault.read_file(&meta_path)
+            .map_err(|_| anyhow!("no session meta for device {}", recipient_device_id))?;
 
         Ok((ratchet_state, meta))
     }
@@ -348,18 +375,14 @@ impl IdentityStore {
         recipient_device_id: Uuid,
         ratchet_state: &RatchetState,
     ) -> Result<()> {
-        let sessions_dir = self.dir.join("sessions");
-        let ratchet_json = serde_json::to_string_pretty(ratchet_state)?;
-        std::fs::write(
-            sessions_dir.join(format!("{}.ratchet.json", recipient_device_id)),
-            ratchet_json,
-        )?;
+        let ratchet_path = format!("sessions/{}.ratchet.enc", recipient_device_id);
+        self.vault.write_file(&ratchet_path, ratchet_state)?;
         Ok(())
     }
 
     /// List all session device UUIDs
     pub fn list_sessions(&self) -> Result<Vec<Uuid>> {
-        let sessions_dir = self.dir.join("sessions");
+        let sessions_dir = self.dir.join("vault").join("sessions");
         if !sessions_dir.exists() {
             return Ok(Vec::new());
         }
@@ -367,8 +390,8 @@ impl IdentityStore {
         for entry in std::fs::read_dir(&sessions_dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".meta.json") {
-                let uuid_str = name.trim_end_matches(".meta.json");
+            if name.ends_with(".meta.enc") {
+                let uuid_str = name.trim_end_matches(".meta.enc");
                 if let Ok(uuid) = uuid_str.parse::<Uuid>() {
                     uuids.push(uuid);
                 }
@@ -378,22 +401,16 @@ impl IdentityStore {
     }
 
     pub fn save_last_sth(&self, sth: &echo_crypto::transparency::SignedTreeHead) -> Result<()> {
-        let json = serde_json::to_string_pretty(sth)?;
-        std::fs::write(self.dir.join("last_sth.json"), json)?;
+        self.vault.write_file("last_sth.enc", sth)?;
         Ok(())
     }
 
     pub fn load_last_sth(&self) -> Option<echo_crypto::transparency::SignedTreeHead> {
-        let path = self.dir.join("last_sth.json");
-        if !path.exists() {
-            return None;
-        }
-        let json = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&json).ok()
+        self.vault.read_file("last_sth.enc").ok()
     }
 
     pub fn clear_last_sth(&self) -> Result<()> {
-        let path = self.dir.join("last_sth.json");
+        let path = self.dir.join("vault").join("last_sth.enc");
         if path.exists() {
             std::fs::remove_file(path)?;
         }
@@ -401,13 +418,12 @@ impl IdentityStore {
     }
 
     pub fn save_server_transparency_key(&self, pubkey_hex: &str) -> Result<()> {
-        std::fs::write(self.dir.join("server_transparency_key.hex"), pubkey_hex)?;
+        self.vault.write_file("server_transparency_key.enc", &pubkey_hex.to_string())?;
         Ok(())
     }
 
     pub fn load_server_transparency_key(&self) -> Option<String> {
-        let path = self.dir.join("server_transparency_key.hex");
-        std::fs::read_to_string(path).ok()
+        self.vault.read_file::<String>("server_transparency_key.enc").ok()
     }
 }
 
@@ -468,10 +484,35 @@ pub fn build_sender_cert(state: &IdentityState) -> SenderCertificate {
         .as_secs()
         + 86400;
 
-    SenderCertificate {
+    let mut cert = SenderCertificate {
         sender_identity: IdentityPublicKey(ik),
         sender_device_id: DeviceId(device_bytes),
         expiry,
-        server_signature: vec![0u8; 64], // POC placeholder
-    }
+        server_signature: vec![0u8; 64], // POC placeholder (no server sig)
+        sender_signature: vec![],
+    };
+
+    // Counter-sign with our Ed25519 key (C1)
+    let mut ed_priv = [0u8; 32];
+    ed_priv.copy_from_slice(&state.identity_ed_private);
+    echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+    ed_priv.zeroize();
+
+    cert
+}
+
+/// C3/C4: Sign our identity_dh_key with our Ed25519 identity key.
+/// Returns the signature binding the DH key to Ed25519 identity.
+pub fn sign_identity_dh_binding(state: &IdentityState) -> Vec<u8> {
+    use echo_crypto::crypto::ed25519::Ed25519KeyPair;
+
+    let mut ed_bytes = [0u8; 32];
+    ed_bytes.copy_from_slice(&state.identity_ed_private);
+    let ed_key = Ed25519KeyPair::from_private_bytes(ed_bytes);
+    ed_bytes.zeroize();
+
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"echo-dh-binding:");
+    msg.extend_from_slice(&state.identity_dh_public);
+    ed_key.sign(&msg)
 }

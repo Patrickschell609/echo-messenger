@@ -23,6 +23,8 @@ pub struct UploadPrekeysRequest {
     pub identity_key: String,
     /// X25519 identity DH public key (32 bytes, hex)
     pub identity_dh_key: String,
+    /// C3: Ed25519 signature binding identity_dh_key to identity_key (hex, 64 bytes)
+    pub identity_dh_key_sig: Option<String>,
     /// X25519 signed prekey (32 bytes, hex)
     pub signed_prekey: String,
     /// Ed25519 signature of signed prekey (64 bytes, hex)
@@ -52,6 +54,8 @@ pub struct UploadPrekeysResponse {
     pub device_id: Uuid,
     /// Server-signed sender certificate for sealed sender (hex-encoded bincode)
     pub sender_cert: Option<String>,
+    /// Human-friendly short code (e.g. "A7X2KM9P")
+    pub short_code: Option<String>,
 }
 
 pub async fn upload_prekeys(
@@ -155,13 +159,19 @@ pub async fn upload_prekeys(
         .transpose()
         .map_err(|_| ApiError::BadRequest("invalid pq_prekey_sig hex".into()))?;
 
+    // C3: Decode identity_dh_key binding signature
+    let identity_dh_key_sig = req.identity_dh_key_sig.as_ref().map(|h| hex::decode(h))
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("invalid identity_dh_key_sig hex".into()))?;
+
     // Upsert device (insert or update on conflict)
     let (device_id,): (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO devices (account_id, identity_key, identity_dh_key, signed_prekey, signed_prekey_sig, signed_prekey_id, pq_prekey, pq_prekey_sig, pq_prekey_id, last_seen)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        INSERT INTO devices (account_id, identity_key, identity_dh_key, identity_dh_key_sig, signed_prekey, signed_prekey_sig, signed_prekey_id, pq_prekey, pq_prekey_sig, pq_prekey_id, last_seen)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         ON CONFLICT (account_id, identity_key) DO UPDATE SET
             identity_dh_key = EXCLUDED.identity_dh_key,
+            identity_dh_key_sig = EXCLUDED.identity_dh_key_sig,
             signed_prekey = EXCLUDED.signed_prekey,
             signed_prekey_sig = EXCLUDED.signed_prekey_sig,
             signed_prekey_id = EXCLUDED.signed_prekey_id,
@@ -175,6 +185,7 @@ pub async fn upload_prekeys(
     .bind(req.account_id)
     .bind(&identity_key)
     .bind(&identity_dh_key)
+    .bind(&identity_dh_key_sig)
     .bind(&signed_prekey)
     .bind(&signed_prekey_sig)
     .bind(req.signed_prekey_id)
@@ -183,6 +194,35 @@ pub async fn upload_prekeys(
     .bind(req.pq_prekey_id)
     .fetch_one(&state.db)
     .await?;
+
+    // Generate short code if device doesn't have one yet
+    let short_code: Option<String> = {
+        let existing: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT short_code FROM devices WHERE id = $1"
+        )
+        .bind(device_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        match existing.and_then(|r| r.0) {
+            Some(code) => Some(code),
+            None => {
+                // Generate and assign a unique short code
+                let code = generate_unique_short_code(&state.db, &state.redis).await?;
+                sqlx::query("UPDATE devices SET short_code = $1 WHERE id = $2")
+                    .bind(&code)
+                    .bind(device_id)
+                    .execute(&state.db)
+                    .await?;
+                Some(code)
+            }
+        }
+    };
+
+    // Limit one-time prekeys
+    if req.one_time_prekeys.len() > 200 {
+        return Err(ApiError::BadRequest("max 200 prekeys per upload".into()));
+    }
 
     // Insert one-time prekeys
     for otpk in &req.one_time_prekeys {
@@ -249,15 +289,17 @@ pub async fn upload_prekeys(
         sender_device_id: echo_crypto::DeviceId(device_bytes),
         expiry,
         server_signature: server_sig,
+        sender_signature: vec![], // Client must counter-sign after receiving (C1)
     };
 
     let cert_bytes = bincode::serialize(&sender_cert).ok();
     let cert_hex = cert_bytes.map(|b| hex::encode(b));
 
-    tracing::info!("device {} uploaded prekeys ({} one-time)", device_id, req.one_time_prekeys.len());
+    tracing::info!("device {} uploaded prekeys ({} one-time), short_code={:?}", device_id, req.one_time_prekeys.len(), short_code);
     Ok(Json(UploadPrekeysResponse {
         device_id,
         sender_cert: cert_hex,
+        short_code,
     }))
 }
 
@@ -268,6 +310,8 @@ pub async fn upload_prekeys(
 pub struct FetchPrekeysResponse {
     pub identity_key: String,
     pub identity_dh_key: String,
+    /// C3: Ed25519 signature binding identity_dh_key to identity_key (hex)
+    pub identity_dh_key_sig: Option<String>,
     pub signed_prekey: String,
     pub signed_prekey_sig: String,
     pub signed_prekey_id: i32,
@@ -287,7 +331,7 @@ pub async fn fetch_prekeys(
 ) -> Result<Json<FetchPrekeysResponse>, ApiError> {
     // Require Ed25519 authentication
     let path = format!("/v1/keys/{}", device_id);
-    let _requester = authenticate_device(&headers, "GET", &path, &state.db).await?;
+    let _requester = authenticate_device(&headers, "GET", &path, &state.db, &state.redis).await?;
 
     // Check if client sent their last-seen tree size (for consistency proof)
     let client_tree_size: Option<u64> = headers
@@ -296,10 +340,11 @@ pub async fn fetch_prekeys(
         .and_then(|s| s.parse().ok());
 
     // Fetch device keys
-    let row: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<i32>) =
+    let row: (Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Vec<u8>, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<i32>) =
         sqlx::query_as(
             r#"
-            SELECT identity_key, identity_dh_key, signed_prekey, signed_prekey_sig, signed_prekey_id,
+            SELECT identity_key, identity_dh_key, identity_dh_key_sig,
+                   signed_prekey, signed_prekey_sig, signed_prekey_id,
                    pq_prekey, pq_prekey_sig, pq_prekey_id
             FROM devices WHERE id = $1
             "#
@@ -355,12 +400,13 @@ pub async fn fetch_prekeys(
     Ok(Json(FetchPrekeysResponse {
         identity_key: hex::encode(&row.0),
         identity_dh_key: hex::encode(&row.1),
-        signed_prekey: hex::encode(&row.2),
-        signed_prekey_sig: hex::encode(&row.3),
-        signed_prekey_id: row.4,
-        pq_prekey: row.5.as_ref().map(hex::encode),
-        pq_prekey_sig: row.6.as_ref().map(hex::encode),
-        pq_prekey_id: row.7,
+        identity_dh_key_sig: row.2.as_ref().map(hex::encode),
+        signed_prekey: hex::encode(&row.3),
+        signed_prekey_sig: hex::encode(&row.4),
+        signed_prekey_id: row.5,
+        pq_prekey: row.6.as_ref().map(hex::encode),
+        pq_prekey_sig: row.7.as_ref().map(hex::encode),
+        pq_prekey_id: row.8,
         one_time_prekey: otpk.as_ref().map(|(_, pk)| hex::encode(pk)),
         one_time_prekey_id: otpk.as_ref().map(|(id, _)| *id),
         transparency,
@@ -408,7 +454,7 @@ pub async fn get_transparency_proof(
 ) -> Result<Json<TransparencyProofBundle>, ApiError> {
     // Require Ed25519 authentication (NEW-03)
     let path = format!("/v1/transparency/proof/{}", device_id);
-    let _requester = authenticate_device(&headers, "GET", &path, &state.db).await?;
+    let _requester = authenticate_device(&headers, "GET", &path, &state.db, &state.redis).await?;
 
     let client_tree_size: Option<u64> = headers
         .get("x-kt-tree-size")
@@ -438,6 +484,7 @@ pub async fn prekey_count(
         "GET",
         "/v1/keys/prekey-count",
         &state.db,
+        &state.redis,
     )
     .await?;
 
@@ -473,6 +520,7 @@ pub async fn upload_additional_otps(
         "POST",
         "/v1/keys/upload-otps",
         &state.db,
+        &state.redis,
     )
     .await?;
 
@@ -513,13 +561,16 @@ async fn build_transparency_proof(
     client_tree_size: Option<u64>,
 ) -> Result<Option<TransparencyProofBundle>, ApiError> {
     // Load all transparency log entries
-    let rows: Vec<(i64, Uuid, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> =
+    // C2: Select logged_at (original upload timestamp) instead of using now()
+    let rows: Vec<(i64, Uuid, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, i64)> =
         sqlx::query_as(
             r#"
             SELECT sequence_id, device_id,
-                   identity_key, identity_dh_key, signed_prekey, pq_prekey_hash
+                   identity_key, identity_dh_key, signed_prekey, pq_prekey_hash,
+                   COALESCE(EXTRACT(EPOCH FROM logged_at)::BIGINT, 0) as logged_epoch
             FROM key_transparency_log
             ORDER BY sequence_id ASC
+            LIMIT 50000
             "#
         )
         .fetch_all(&state.db)
@@ -539,14 +590,14 @@ async fn build_transparency_proof(
     let mut leaf_hashes: Vec<[u8; 32]> = Vec::with_capacity(rows.len());
     let mut target_index: Option<usize> = None;
 
-    for (i, (seq_id, dev_id, ik, idk, spk, pqh)) in rows.iter().enumerate() {
+    for (i, (seq_id, dev_id, ik, idk, spk, pqh, logged_epoch)) in rows.iter().enumerate() {
         let leaf = TransparencyLeaf {
             device_id: dev_id.as_bytes().to_vec(),
             identity_key: ik.clone().unwrap_or_default(),
             identity_dh_key: idk.clone().unwrap_or_default(),
             signed_prekey: spk.clone().unwrap_or_default(),
             pq_prekey_hash: pqh.clone().unwrap_or_default(),
-            timestamp: now,
+            timestamp: *logged_epoch as u64, // C2: use original upload time
             sequence_id: *seq_id,
         };
         leaf_hashes.push(leaf.hash());
@@ -610,33 +661,31 @@ async fn build_transparency_proof(
 
 /// Load all leaf hashes from the transparency log.
 async fn load_all_leaf_hashes(state: &AppState) -> Result<Vec<[u8; 32]>, ApiError> {
-    let rows: Vec<(i64, Uuid, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> =
+    // C2: Select logged_at (original upload timestamp) instead of using now()
+    let rows: Vec<(i64, Uuid, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, i64)> =
         sqlx::query_as(
             r#"
             SELECT sequence_id, device_id,
-                   identity_key, identity_dh_key, signed_prekey, pq_prekey_hash
+                   identity_key, identity_dh_key, signed_prekey, pq_prekey_hash,
+                   COALESCE(EXTRACT(EPOCH FROM logged_at)::BIGINT, 0) as logged_epoch
             FROM key_transparency_log
             ORDER BY sequence_id ASC
+            LIMIT 50000
             "#
         )
         .fetch_all(&state.db)
         .await?;
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
     let hashes: Vec<[u8; 32]> = rows
         .iter()
-        .map(|(seq_id, dev_id, ik, idk, spk, pqh)| {
+        .map(|(seq_id, dev_id, ik, idk, spk, pqh, logged_epoch)| {
             TransparencyLeaf {
                 device_id: dev_id.as_bytes().to_vec(),
                 identity_key: ik.clone().unwrap_or_default(),
                 identity_dh_key: idk.clone().unwrap_or_default(),
                 signed_prekey: spk.clone().unwrap_or_default(),
                 pq_prekey_hash: pqh.clone().unwrap_or_default(),
-                timestamp: now,
+                timestamp: *logged_epoch as u64, // C2: use original upload time
                 sequence_id: *seq_id,
             }
             .hash()
@@ -644,6 +693,64 @@ async fn load_all_leaf_hashes(state: &AppState) -> Result<Vec<[u8; 32]>, ApiErro
         .collect();
 
     Ok(hashes)
+}
+
+/// Unambiguous alphabet for short codes (no O/0/I/1/L).
+const SHORT_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+/// Generate a random 8-character short code from the unambiguous alphabet.
+fn generate_short_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..8)
+        .map(|_| SHORT_CODE_ALPHABET[rng.gen_range(0..SHORT_CODE_ALPHABET.len())] as char)
+        .collect()
+}
+
+/// Generate a unique short code, retrying on collision (astronomically unlikely).
+async fn generate_unique_short_code(db: &sqlx::PgPool, _redis: &redis::Client) -> Result<String, ApiError> {
+    for _ in 0..10 {
+        let code = generate_short_code();
+        let exists: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM devices WHERE short_code = $1"
+        )
+        .bind(&code)
+        .fetch_optional(db)
+        .await?;
+
+        if exists.is_none() {
+            return Ok(code);
+        }
+    }
+    Err(ApiError::Internal("failed to generate unique short code after 10 attempts".into()))
+}
+
+/// Backfill short codes for any existing devices that don't have one.
+/// Called once at server startup.
+pub async fn backfill_short_codes(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    let devices: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM devices WHERE short_code IS NULL"
+    )
+    .fetch_all(db)
+    .await?;
+
+    let count = devices.len();
+    for (device_id,) in devices {
+        let code = generate_short_code();
+        // Ignore unique constraint violations (retry not needed for backfill)
+        sqlx::query("UPDATE devices SET short_code = $1 WHERE id = $2 AND short_code IS NULL")
+            .bind(&code)
+            .bind(device_id)
+            .execute(db)
+            .await
+            .ok();
+    }
+
+    if count > 0 {
+        tracing::info!("backfilled short codes for {} devices", count);
+    }
+
+    Ok(())
 }
 
 fn sha256(data: &[u8]) -> Vec<u8> {

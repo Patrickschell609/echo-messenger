@@ -53,6 +53,7 @@ pub enum WsOutbound {
 struct WsAuthMessage {
     device_id: String,
     timestamp: String,
+    nonce: String,
     signature: String,
 }
 
@@ -183,9 +184,15 @@ impl WsClient {
         let timestamp_str = timestamp.to_string();
         let device_id_str = self.device_id.to_string();
 
+        // Generate random nonce for replay protection
+        let mut nonce_bytes = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
+        let nonce_hex = hex::encode(nonce_bytes);
+
         let mut message = Vec::new();
         message.extend_from_slice(device_id_str.as_bytes());
         message.extend_from_slice(timestamp_str.as_bytes());
+        message.extend_from_slice(nonce_hex.as_bytes());
         message.extend_from_slice(b"GET");
         message.extend_from_slice(b"/v1/ws");
 
@@ -197,6 +204,7 @@ impl WsClient {
         WsAuthMessage {
             device_id: device_id_str,
             timestamp: timestamp_str,
+            nonce: nonce_hex,
             signature: sig_hex,
         }
     }

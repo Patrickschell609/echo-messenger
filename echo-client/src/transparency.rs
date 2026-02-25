@@ -8,11 +8,12 @@ use echo_crypto::transparency::{
 };
 use echo_crypto::types::IdentityPublicKey;
 
-const SERVER_TRANSPARENCY_PUBKEY: [u8; 32] = [0u8; 32];
-
-fn is_poc_mode() -> bool {
-    SERVER_TRANSPARENCY_PUBKEY == [0u8; 32]
-}
+const SERVER_TRANSPARENCY_PUBKEY: [u8; 32] = [
+    0x4a, 0x27, 0xcc, 0xd7, 0x5a, 0xac, 0xb5, 0xa5,
+    0xc1, 0x31, 0x19, 0x0d, 0x9c, 0x2f, 0xc9, 0xb7,
+    0xe0, 0xb3, 0x89, 0x55, 0x32, 0x2c, 0x9d, 0x5a,
+    0xd9, 0x1e, 0xfc, 0xb2, 0xe2, 0x07, 0x88, 0x32,
+];
 
 pub fn verify_transparency(
     bundle: &TransparencyProofBundle,
@@ -22,22 +23,8 @@ pub fn verify_transparency(
     server_pubkey_hex: Option<&str>,
 ) -> Result<()> {
     // 1. Verify STH signature
-    let pubkey = if is_poc_mode() {
-        if let Some(hex_key) = server_pubkey_hex {
-            let bytes = hex::decode(hex_key)
-                .map_err(|_| anyhow!("invalid server transparency public key hex"))?;
-            if bytes.len() != 32 {
-                return Err(anyhow!("server transparency key must be 32 bytes"));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes);
-            IdentityPublicKey(arr)
-        } else {
-            return Err(anyhow!("no server transparency public key available"));
-        }
-    } else {
-        IdentityPublicKey(SERVER_TRANSPARENCY_PUBKEY)
-    };
+    let _ = server_pubkey_hex; // no longer needed — key is hardcoded
+    let pubkey = IdentityPublicKey(SERVER_TRANSPARENCY_PUBKEY);
 
     verify_sth(&bundle.sth, &pubkey)
         .map_err(|_| anyhow!("TRANSPARENCY FAILURE: STH signature invalid"))?;
@@ -59,8 +46,12 @@ pub fn verify_transparency(
     verify_inclusion_proof(&leaf_hash, &bundle.inclusion_proof, &bundle.sth.root_hash)
         .map_err(|_| anyhow!("TRANSPARENCY FAILURE: inclusion proof invalid"))?;
 
-    // 4. Verify consistency with cached STH
-    if let (Some(prev_sth), Some(consistency)) = (last_sth, &bundle.consistency_proof) {
+    // 4. Verify consistency with cached STH — MANDATORY when we have a previous STH
+    if let Some(prev_sth) = last_sth {
+        let consistency = bundle.consistency_proof.as_ref()
+            .ok_or_else(|| anyhow!(
+                "TRANSPARENCY FAILURE: server omitted consistency proof — possible tree rewrite"
+            ))?;
         verify_consistency_proof(consistency, &prev_sth.root_hash, &bundle.sth.root_hash)
             .map_err(|_| anyhow!("TRANSPARENCY FAILURE: consistency proof failed — tree was rewritten!"))?;
     }

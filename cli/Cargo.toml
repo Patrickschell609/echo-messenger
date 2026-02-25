@@ -9,7 +9,11 @@ description = "ECHO Messenger CLI client"
 name = "echo"
 path = "src/main.rs"
 
+[features]
+e2e = ["tempfile"]
+
 [dependencies]
+tempfile = { version = "3", optional = true }
 echo-crypto = { path = "../shared" }
 echo-client = { path = "../echo-client" }
 tokio = { workspace = true }

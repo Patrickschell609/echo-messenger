@@ -28,9 +28,14 @@ use sha2::Sha256;
 use zeroize::Zeroize;
 
 /// Argon2id parameters — 64MB memory, 3 iterations, 1 thread.
+/// Balanced for security + usability on low-RAM devices.
 const ARGON2_M_COST: u32 = 65536; // 64 MB
 const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
+
+/// Canary magic bytes — encrypted during create(), verified during unlock().
+/// Prevents wrong-passphrase acceptance when identity.enc is missing.
+const VAULT_CANARY_MAGIC: &[u8; 32] = b"ECHO_VAULT_CANARY_2025_VERIFIED!";
 
 pub struct EncryptedVault {
     base_dir: PathBuf,
@@ -73,10 +78,14 @@ impl EncryptedVault {
         std::fs::create_dir_all(self.base_dir.join("groups"))?;
 
         let mut salt = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rngs::OsRng.fill_bytes(&mut salt);
         std::fs::write(self.base_dir.join("salt.bin"), &salt)?;
 
         self.master_key = Some(derive_master_key(passphrase, &salt)?);
+
+        // Write canary file — always verified on unlock to catch wrong passphrases
+        self.write_file("canary.enc", &VAULT_CANARY_MAGIC.to_vec())?;
+
         Ok(())
     }
 
@@ -92,11 +101,24 @@ impl EncryptedVault {
 
         self.master_key = Some(derive_master_key(passphrase, &salt_arr)?);
 
-        // Verify by trying to read identity (if it exists)
-        let id_path = self.base_dir.join("identity.enc");
-        if id_path.exists() {
-            self.read_file::<serde_json::Value>("identity.enc")
+        // Always verify canary — rejects wrong passphrase even if identity.enc is missing
+        let canary_path = self.base_dir.join("canary.enc");
+        if canary_path.exists() {
+            let canary: Vec<u8> = self.read_file("canary.enc")
                 .map_err(|_| anyhow!("wrong passphrase"))?;
+            if canary.as_slice() != VAULT_CANARY_MAGIC {
+                self.master_key = None;
+                return Err(anyhow!("wrong passphrase — canary mismatch"));
+            }
+        } else {
+            // Legacy vault without canary — fall back to identity check, then create canary
+            let id_path = self.base_dir.join("identity.enc");
+            if id_path.exists() {
+                self.read_file::<serde_json::Value>("identity.enc")
+                    .map_err(|_| anyhow!("wrong passphrase"))?;
+            }
+            // Migrate: write canary for future unlocks
+            self.write_file("canary.enc", &VAULT_CANARY_MAGIC.to_vec())?;
         }
 
         Ok(())
@@ -301,7 +323,7 @@ fn encrypt_data(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("AES key init: {}", e))?;
 
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher

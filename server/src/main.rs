@@ -33,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = db::create_pool(&config.database_url).await?;
     db::run_migrations(&db_pool).await?;
 
+    // Backfill short codes for existing devices
+    api::keys::backfill_short_codes(&db_pool).await.ok();
+
     // Initialize Redis (rate limiting)
     let redis = redis::Client::open(config.redis_url.as_str())?;
 
@@ -73,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
             .execute(&state.db)
             .await
             .ok();
-            tracing::info!("=== GENESIS INVITE CODE: {} ===", genesis_code);
+            tracing::info!("genesis invite code created and inserted into DB");
         }
     }
 
@@ -101,9 +104,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router
     let app = Router::new()
-        // Account management
-        .route("/v1/register", post(api::accounts::register))
-        .route("/v1/verify", post(api::accounts::verify))
         // Invite codes
         .route("/v1/invites/generate", post(api::invites::generate_invites))
         .route("/v1/invites/redeem", post(api::invites::redeem_invite))
@@ -122,6 +122,8 @@ async fn main() -> anyhow::Result<()> {
         // Profiles
         .route("/v1/profile/update", post(api::profiles::update_profile))
         .route("/v1/profile/{device_id}", get(api::profiles::get_profile))
+        // Short code lookup
+        .route("/v1/lookup/{code}", get(api::profiles::lookup_by_code))
         // Groups
         .route("/v1/groups", post(api::groups::create_group))
         .route("/v1/groups", get(api::groups::list_groups))

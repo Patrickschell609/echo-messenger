@@ -29,6 +29,7 @@ pub async fn generate_invites(
         "POST",
         "/v1/invites/generate",
         &state.db,
+        &state.redis,
     )
     .await?;
 
@@ -85,9 +86,14 @@ const MIN_RESPONSE_MS: u64 = 200;
 
 pub async fn redeem_invite(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RedeemInviteRequest>,
 ) -> Result<Json<RedeemInviteResponse>, ApiError> {
     let start = std::time::Instant::now();
+
+    // Rate limit by IP
+    let ip = extract_client_ip(&headers);
+    check_invite_rate_limit(&state.redis, &ip).await?;
 
     let code = req.invite_code.trim();
     if code.is_empty() || code.len() > 64 {
@@ -98,6 +104,9 @@ pub async fn redeem_invite(
     // Hash the code
     use sha2::{Digest, Sha256};
     let code_hash = Sha256::digest(code.as_bytes());
+
+    // Start explicit transaction so FOR UPDATE lock holds across all queries
+    let mut tx = state.db.begin().await?;
 
     // Atomic: lock the invite code row, verify it's valid and unredeemed
     let invite_row: Option<(i64, Option<Uuid>)> = sqlx::query_as(
@@ -112,13 +121,13 @@ pub async fn redeem_invite(
         "#,
     )
     .bind(&code_hash[..])
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let (invite_id, creator_device_id) = match invite_row {
         Some(row) => row,
         None => {
-            // Constant-time: sleep to min response time, then error
+            // Transaction drops here (implicit rollback)
             pad_response_time(start).await;
             return Err(ApiError::BadRequest("invalid or expired invite code".into()));
         }
@@ -128,7 +137,7 @@ pub async fn redeem_invite(
     let invited_by: Option<Uuid> = if let Some(dev_id) = creator_device_id {
         sqlx::query_as::<_, (Uuid,)>("SELECT account_id FROM devices WHERE id = $1")
             .bind(dev_id)
-            .fetch_optional(&state.db)
+            .fetch_optional(&mut *tx)
             .await?
             .map(|(aid,)| aid)
     } else {
@@ -149,7 +158,7 @@ pub async fn redeem_invite(
     )
     .bind(&nonce[..])
     .bind(invited_by)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
 
     // Mark invite as redeemed
@@ -162,8 +171,11 @@ pub async fn redeem_invite(
     )
     .bind(account_id)
     .bind(invite_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+
+    // Commit the transaction
+    tx.commit().await?;
 
     tracing::info!("invite redeemed, new account {}", account_id);
 
@@ -173,6 +185,75 @@ pub async fn redeem_invite(
         account_id,
         auth_nonce: hex::encode(nonce),
     }))
+}
+
+/// Rate limit: max invite redemption attempts per minute per IP.
+const INVITE_RATE_LIMIT_PER_MINUTE: i64 = 10;
+
+/// Sliding window rate limit for invite redemption via Redis sorted sets.
+async fn check_invite_rate_limit(redis_client: &redis::Client, ip: &str) -> Result<(), ApiError> {
+    let mut conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("redis unavailable for invite rate limit, rejecting: {}", e);
+            return Err(ApiError::TooManyRequests("rate limit service unavailable".into()));
+        }
+    };
+
+    let key = format!("rate:invite:{}", ip);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let window_start = now_ms - 60_000;
+
+    redis::cmd("ZREMRANGEBYSCORE")
+        .arg(&key)
+        .arg("-inf")
+        .arg(window_start)
+        .query_async::<()>(&mut conn)
+        .await
+        .ok();
+
+    let count: i64 = redis::cmd("ZCARD")
+        .arg(&key)
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(0);
+
+    if count >= INVITE_RATE_LIMIT_PER_MINUTE {
+        return Err(ApiError::TooManyRequests(
+            "rate limit exceeded, try again later".into(),
+        ));
+    }
+
+    let member = format!("{}-{:08x}", now_ms, rand::random::<u32>());
+    redis::cmd("ZADD")
+        .arg(&key)
+        .arg(now_ms)
+        .arg(&member)
+        .query_async::<()>(&mut conn)
+        .await
+        .ok();
+
+    redis::cmd("EXPIRE")
+        .arg(&key)
+        .arg(120)
+        .query_async::<()>(&mut conn)
+        .await
+        .ok();
+
+    Ok(())
+}
+
+/// Extract client IP — same security-hardened version as messages.rs
+fn extract_client_ip(headers: &HeaderMap) -> String {
+    let trusted = std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default();
+    if trusted.is_empty() {
+        return "unknown".to_string();
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Pad response to minimum time to prevent timing attacks.

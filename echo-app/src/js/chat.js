@@ -345,12 +345,25 @@ const Chat = {
     }
 
     try {
-      const result = await API.establishSession(this.deviceId);
-      // Guard: event listener may have already handled this
-      if (!this.hasSession) {
-        this.hasSession = true;
-        this.establishing = false;
-        this.onSessionReady(result);
+      // Prevent dual-initiator race: only the lower UUID initiates.
+      // The higher UUID waits for the incoming PreKey message, and the
+      // poller builds a responder session automatically.
+      const ourDeviceId = await API.getDeviceId();
+      if (ourDeviceId < this.deviceId) {
+        // We are the lower UUID — we initiate the session
+        console.log('[ECHO] We are lower UUID, initiating session');
+        const result = await API.establishSession(this.deviceId);
+        if (!this.hasSession) {
+          this.hasSession = true;
+          this.establishing = false;
+          this.onSessionReady(result);
+        }
+      } else {
+        // We are the higher UUID — wait for peer's PreKey message
+        // The poller will emit SESSION_ESTABLISHED when it arrives
+        console.log('[ECHO] We are higher UUID, waiting for peer to initiate');
+        this.establishing = true;
+        // The establishing spinner stays visible; onSessionEstablished() will clear it
       }
     } catch (e) {
       this.establishing = false;
@@ -629,7 +642,7 @@ const Chat = {
 
     let content = '';
     if (msg.media_url && msg.media_mime && msg.media_mime.startsWith('image/')) {
-      content = `<img class="message-image" src="${msg.media_url}" alt="${esc(msg.media_filename || 'Image')}">`;
+      content = `<img class="message-image" src="${esc(msg.media_url)}" alt="${esc(msg.media_filename || 'Image')}">`;
     } else if (msg.media_filename) {
       content = `<span class="message-file">&#128206; ${esc(msg.media_filename)}</span>`;
     } else {

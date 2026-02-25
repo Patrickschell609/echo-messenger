@@ -88,21 +88,32 @@ async fn check_send_rate_limit(redis_client: &redis::Client, ip: &str) -> Result
     Ok(())
 }
 
-/// Extract client IP from proxy headers, falling back to "direct".
-/// Uses LAST IP in X-Forwarded-For (rightmost = closest proxy, not spoofable by client).
-fn extract_client_ip(headers: &HeaderMap) -> String {
+/// Extract client IP for rate limiting.
+/// SECURITY: Never trust X-Forwarded-For or X-Real-IP directly — clients can spoof them.
+/// Only use proxy headers if TRUSTED_PROXY_CIDRS env var is configured and the connection
+/// comes from a trusted proxy. Otherwise use the peer address from ConnectInfo.
+///
+/// For now, we fall back to "unknown" which groups all non-proxied clients together.
+/// In production, pass the real peer IP via axum::extract::ConnectInfo<SocketAddr>.
+fn extract_client_ip(headers: &HeaderMap, peer_addr: Option<&str>) -> String {
+    // If we have a direct peer address, prefer it (not spoofable)
+    if let Some(addr) = peer_addr {
+        return addr.to_string();
+    }
+
+    // Only trust proxy headers if TRUSTED_PROXIES is configured
+    let trusted = std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default();
+    if trusted.is_empty() {
+        // No trusted proxies configured — ignore XFF/X-Real-IP entirely
+        return "unknown".to_string();
+    }
+
+    // If behind a trusted proxy, use X-Real-IP (set by the proxy, not the client)
     headers
-        .get("x-forwarded-for")
+        .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').last())
         .map(|s| s.trim().to_string())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "direct".to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub async fn send_message(
@@ -111,7 +122,7 @@ pub async fn send_message(
     Json(req): Json<SendMessageRequest>,
 ) -> Result<Json<SendMessageResponse>, ApiError> {
     // IP-based rate limit (AV-10)
-    let ip = extract_client_ip(&headers);
+    let ip = extract_client_ip(&headers, None); // TODO: pass ConnectInfo peer addr
     check_send_rate_limit(&state.redis, &ip).await?;
 
     let envelope = hex::decode(&req.envelope)
@@ -140,11 +151,12 @@ pub async fn send_message(
         return Err(ApiError::NotFound("recipient device not found".into()));
     }
 
-    // Atomic queue depth check + insert (prevents TOCTOU race)
+    // Atomic queue depth check + insert with TTL (prevents TOCTOU race + harvest-now-decrypt-later)
+    // Messages expire after 30 days — prevents indefinite accumulation on seized servers
     let insert_result: Option<(i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         r#"
-        INSERT INTO message_queue (recipient_device_id, envelope)
-        SELECT $1, $2
+        INSERT INTO message_queue (recipient_device_id, envelope, expires_at)
+        SELECT $1, $2, NOW() + INTERVAL '30 days'
         WHERE (SELECT COUNT(*) FROM message_queue WHERE recipient_device_id = $1) < $3
         RETURNING id, queued_at
         "#
@@ -210,6 +222,7 @@ pub async fn receive_messages(
         "GET",
         "/v1/messages/receive",
         &state.db,
+        &state.redis,
     ).await?;
 
     // Fetch queued messages, oldest first, limit 100
@@ -266,6 +279,7 @@ pub async fn ack_message(
         "POST",
         "/v1/messages/ack",
         &state.db,
+        &state.redis,
     ).await?;
 
     if req.message_ids.is_empty() {

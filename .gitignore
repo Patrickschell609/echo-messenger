@@ -3,6 +3,7 @@ target/
 dist/
 
 # Environment and secrets
+.env
 .env.production
 deploy/.env.production
 *.jks
@@ -16,6 +17,11 @@ client/
 
 # Node
 node_modules/
+
+# Session logs and test artifacts
+lanchat-*.json
+*.log
+test-gui.sh
 
 # OS
 .DS_Store

@@ -10,10 +10,25 @@
 
 use std::path::Path;
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use anyhow::{anyhow, Result};
+use rand::RngCore;
+use zeroize::Zeroize;
 
 pub struct OutboxQueue {
     db: rusqlite::Connection,
+    encryption_key: Option<[u8; 32]>,
+}
+
+impl Drop for OutboxQueue {
+    fn drop(&mut self) {
+        if let Some(ref mut key) = self.encryption_key {
+            key.zeroize();
+        }
+    }
 }
 
 pub struct OutboxEntry {
@@ -39,7 +54,51 @@ impl OutboxQueue {
             );
             CREATE INDEX IF NOT EXISTS idx_outbox_queued ON outbox(queued_at);",
         )?;
-        Ok(Self { db })
+        Ok(Self { db, encryption_key: None })
+    }
+
+    /// Open an encrypted outbox (convenience constructor).
+    pub fn open_encrypted(db_path: &Path, key: [u8; 32]) -> Result<Self> {
+        let mut q = Self::open(db_path)?;
+        q.encryption_key = Some(key);
+        Ok(q)
+    }
+
+    /// Encrypt a blob with AES-256-GCM. Returns nonce || ciphertext.
+    fn encrypt_blob(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption_key {
+            Some(key) => {
+                let cipher = Aes256Gcm::new_from_slice(key)
+                    .map_err(|e| anyhow!("AES key init: {}", e))?;
+                let mut nonce_bytes = [0u8; 12];
+                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                let nonce = Nonce::from_slice(&nonce_bytes);
+                let ct = cipher.encrypt(nonce, data)
+                    .map_err(|e| anyhow!("outbox encrypt: {}", e))?;
+                let mut out = Vec::with_capacity(12 + ct.len());
+                out.extend_from_slice(&nonce_bytes);
+                out.extend_from_slice(&ct);
+                Ok(out)
+            }
+            None => Ok(data.to_vec()),
+        }
+    }
+
+    /// Decrypt a blob (nonce || ciphertext) with AES-256-GCM.
+    fn decrypt_blob(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption_key {
+            Some(key) => {
+                if data.len() < 12 {
+                    return Err(anyhow!("encrypted outbox data too short"));
+                }
+                let cipher = Aes256Gcm::new_from_slice(key)
+                    .map_err(|e| anyhow!("AES key init: {}", e))?;
+                let nonce = Nonce::from_slice(&data[..12]);
+                cipher.decrypt(nonce, &data[12..])
+                    .map_err(|e| anyhow!("outbox decrypt: {}", e))
+            }
+            None => Ok(data.to_vec()),
+        }
     }
 
     /// Queue an encrypted message for later delivery. Enforces max 1000 messages.
@@ -61,9 +120,17 @@ impl OutboxQueue {
             .unwrap()
             .as_secs();
 
+        // Encrypt recipient ID and envelope when key is set
+        let enc_device_id = if self.encryption_key.is_some() {
+            hex::encode(self.encrypt_blob(recipient_device_id.as_bytes())?)
+        } else {
+            recipient_device_id.to_string()
+        };
+        let enc_envelope = self.encrypt_blob(envelope)?;
+
         self.db.execute(
             "INSERT INTO outbox (msg_id, recipient_device_id, envelope, queued_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![msg_id, recipient_device_id, envelope, now as i64],
+            rusqlite::params![msg_id, enc_device_id, enc_envelope, now as i64],
         )?;
 
         Ok(self.db.last_insert_rowid())
@@ -87,18 +154,44 @@ impl OutboxQueue {
             "SELECT id, msg_id, recipient_device_id, envelope, queued_at FROM outbox ORDER BY queued_at ASC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok(OutboxEntry {
-                id: row.get(0)?,
-                msg_id: row.get(1)?,
-                recipient_device_id: row.get(2)?,
-                envelope: row.get(3)?,
-                queued_at: row.get::<_, i64>(4)? as u64,
-            })
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)? as u64,
+            ))
         })?;
 
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(row?);
+            let (id, msg_id, raw_device_id, raw_envelope, queued_at) = row?;
+
+            // Decrypt if encryption key is set (gracefully handle legacy unencrypted data)
+            let recipient_device_id = if self.encryption_key.is_some() {
+                match hex::decode(&raw_device_id) {
+                    Ok(enc_bytes) => match self.decrypt_blob(&enc_bytes) {
+                        Ok(plain) => String::from_utf8(plain)
+                            .unwrap_or_else(|_| raw_device_id.clone()),
+                        Err(_) => raw_device_id, // legacy unencrypted row
+                    },
+                    Err(_) => raw_device_id, // legacy unencrypted row (plain UUID with hyphens)
+                }
+            } else {
+                raw_device_id
+            };
+            let envelope = match self.decrypt_blob(&raw_envelope) {
+                Ok(e) => e,
+                Err(_) => raw_envelope, // legacy unencrypted envelope
+            };
+
+            entries.push(OutboxEntry {
+                id,
+                msg_id,
+                recipient_device_id,
+                envelope,
+                queued_at,
+            });
         }
         Ok(entries)
     }

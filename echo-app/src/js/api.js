@@ -42,6 +42,14 @@ const API = {
     return invoke('list_buddies');
   },
 
+  lookupCode(code) {
+    return invoke('lookup_code', { code });
+  },
+
+  getShortCode() {
+    return invoke('get_short_code');
+  },
+
   generateInvites(count) {
     return invoke('generate_invites', { count });
   },

@@ -1,5 +1,7 @@
 use tauri::{AppHandle, Manager};
 
+use echo_client::http::HttpClient;
+
 use crate::state::{AppState, Contact};
 
 /// Add a buddy by device UUID.
@@ -87,4 +89,59 @@ pub fn list_buddies(app: AppHandle) -> Result<Vec<Contact>, String> {
     }
 
     Ok(contacts)
+}
+
+/// Lookup result returned to the frontend.
+#[derive(serde::Serialize)]
+pub struct LookupResult {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub short_code: String,
+}
+
+/// Lookup a device by short code (e.g. "A7X2-KM9P").
+#[tauri::command]
+pub async fn lookup_code(app: AppHandle, code: String) -> Result<LookupResult, String> {
+    let state = app.state::<AppState>();
+
+    let signed_in = *state.signed_in.lock().unwrap();
+    if !signed_in {
+        return Err("Not signed in".to_string());
+    }
+
+    let identity_state = {
+        let id = state.identity.lock().unwrap();
+        id.as_ref().cloned().ok_or("No identity loaded".to_string())?
+    };
+
+    let http = {
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+            }
+            None => return Err("No HTTP client".to_string()),
+        }
+    };
+
+    let resp = http.lookup_by_code(&code).await.map_err(|e| e.to_string())?;
+
+    Ok(LookupResult {
+        device_id: resp.device_id,
+        display_name: resp.display_name,
+        short_code: resp.short_code,
+    })
+}
+
+/// Get the current user's short code.
+#[tauri::command]
+pub fn get_short_code(app: AppHandle) -> Result<Option<String>, String> {
+    let state = app.state::<AppState>();
+    let id = state.identity.lock().unwrap();
+    match id.as_ref() {
+        Some(s) => Ok(s.short_code.clone()),
+        None => Err("Not signed in".to_string()),
+    }
 }

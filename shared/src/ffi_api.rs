@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::ed25519::Ed25519KeyPair;
+use crate::crypto::kdf;
 use crate::crypto::pq_kem;
 use crate::crypto::x25519::X25519KeyPair;
 use crate::ratchet::session::{EncryptedMessage, TripleRatchetSession};
@@ -217,6 +218,8 @@ pub fn ffi_x4dh_respond(
         otp.as_ref(),
         &PqSecretKey(pq_secret_key),
         &their_dh,
+        None, // C4: caller should provide Alice's Ed25519 key
+        None, // C4: caller should provide DH key signature
         &their_eph,
         &PqCiphertext(pq_ciphertext),
     )
@@ -322,6 +325,7 @@ pub fn ffi_seal_message(
         sender_device_id: DeviceId(did),
         expiry,
         server_signature: vec![0u8; 64], // POC placeholder
+        sender_signature: vec![0u8; 64], // POC placeholder (no Ed25519 key available in FFI)
     };
 
     let envelope =
@@ -330,17 +334,23 @@ pub fn ffi_seal_message(
     bincode::serialize(&envelope).map_err(|e| e.to_string())
 }
 
-/// Unseal a sealed sender envelope.
+/// Unseal a sealed sender envelope. Server pubkey is required for cert verification (H1).
 pub fn ffi_unseal_message(
     dh_private: Vec<u8>,
     envelope_bytes: Vec<u8>,
+    server_pubkey: Vec<u8>,
 ) -> Result<FfiUnsealResult, String> {
     let dh = dh_keypair_from_bytes(&dh_private)?;
     let envelope: SealedEnvelope =
         bincode::deserialize(&envelope_bytes).map_err(|e| e.to_string())?;
 
+    let mut spk = [0u8; 32];
+    spk.copy_from_slice(
+        server_pubkey.get(..32).ok_or("server_pubkey must be 32 bytes")?,
+    );
+
     let (cert, tr3_ciphertext) =
-        sealed_sender::unseal_message(&dh, &envelope, None).map_err(|e| e.to_string())?;
+        sealed_sender::unseal_message(&dh, &envelope, &spk).map_err(|e| e.to_string())?;
 
     Ok(FfiUnsealResult {
         sender_identity: cert.sender_identity.0.to_vec(),
@@ -406,10 +416,11 @@ pub fn ffi_build_initiator_state(
         send_message_number: 0,
         recv_message_number: 0,
         prev_sending_chain_length: 0,
-        sending_header_key: None,
-        receiving_header_key: None,
-        next_sending_header_key: None,
-        next_receiving_header_key: None,
+        // M11: Derive initial header keys (initiator direction)
+        sending_header_key: Some(kdf::derive_header_key(&RootKey(root_key), true)),
+        receiving_header_key: Some(kdf::derive_header_key(&RootKey(root_key), false)),
+        next_sending_header_key: Some(kdf::derive_header_key(&RootKey(root_key), true)),
+        next_receiving_header_key: Some(kdf::derive_header_key(&RootKey(root_key), false)),
         skipped_keys: HashMap::new(),
         processed_ids: HashSet::new(),
         processed_order: VecDeque::new(),
@@ -475,10 +486,11 @@ pub fn ffi_build_responder_state(
         send_message_number: 0,
         recv_message_number: 0,
         prev_sending_chain_length: 0,
-        sending_header_key: None,
-        receiving_header_key: None,
-        next_sending_header_key: None,
-        next_receiving_header_key: None,
+        // M11: Derive initial header keys (responder swaps send/recv direction)
+        sending_header_key: Some(kdf::derive_header_key(&RootKey(root_key), false)),
+        receiving_header_key: Some(kdf::derive_header_key(&RootKey(root_key), true)),
+        next_sending_header_key: Some(kdf::derive_header_key(&RootKey(root_key), false)),
+        next_receiving_header_key: Some(kdf::derive_header_key(&RootKey(root_key), true)),
         skipped_keys: HashMap::new(),
         processed_ids: HashSet::new(),
         processed_order: VecDeque::new(),

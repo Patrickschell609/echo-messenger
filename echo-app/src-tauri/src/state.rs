@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use echo_client::history::EncryptedHistory;
@@ -7,6 +8,21 @@ use echo_client::outbox::OutboxQueue;
 use echo_client::storage::EncryptedVault;
 use echo_client::ws::WsOutbound;
 use uuid::Uuid;
+
+/// Resolve the vault path. In dev-multi builds, ECHO_VAULT_PATH overrides for testing
+/// two instances on one machine. Feature-gated so it can never ship.
+pub fn vault_path() -> anyhow::Result<PathBuf> {
+    #[cfg(feature = "dev-multi")]
+    {
+        if let Ok(p) = std::env::var("ECHO_VAULT_PATH") {
+            tracing::warn!("DEV-MULTI: using custom vault path: {}", p);
+            let path = PathBuf::from(p);
+            std::fs::create_dir_all(&path).ok();
+            return Ok(path);
+        }
+    }
+    EncryptedVault::default_path()
+}
 
 /// Shared application state, managed by Tauri.
 pub struct AppState {
@@ -22,13 +38,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let vault_path = EncryptedVault::default_path()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/echo-vault"));
+        let vault_path = vault_path()
+            .expect("FATAL: cannot determine vault path -- refusing to start with insecure defaults");
         Self {
             http: Mutex::new(None),
             vault: Mutex::new(EncryptedVault::new(&vault_path)),
             identity: Mutex::new(None),
-            server_url: Mutex::new("http://localhost:8080".to_string()),
+            server_url: Mutex::new("https://echo.biotwin.io".to_string()),
             signed_in: Mutex::new(false),
             history: Mutex::new(None),
             outbox: Mutex::new(None),

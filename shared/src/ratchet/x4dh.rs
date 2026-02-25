@@ -41,6 +41,18 @@ impl X4DH {
         our_identity_dh: &X25519KeyPair,
         their_bundle: &PrekeyBundle,
     ) -> Result<X4DHInitResult> {
+        // C3: Verify Bob's identity_dh_key is bound to his Ed25519 identity
+        if !their_bundle.identity_dh_key_signature.is_empty() {
+            let mut dh_bind_msg = Vec::new();
+            dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
+            dh_bind_msg.extend_from_slice(&their_bundle.identity_dh_key.0);
+            Ed25519KeyPair::verify(
+                &their_bundle.identity_key,
+                &dh_bind_msg,
+                &their_bundle.identity_dh_key_signature,
+            )?;
+        }
+
         // Verify Bob's signed prekey signature
         let spk_bytes = &their_bundle.signed_prekey.0;
         Ed25519KeyPair::verify(
@@ -84,7 +96,12 @@ impl X4DH {
         }
         secrets.push(&pq_ss);
 
-        let (root_key, chain_key) = kdf::kdf_session(&secrets);
+        // M8: Bind session to both parties' identities (initiator=us, responder=them)
+        let (root_key, chain_key) = kdf::kdf_session(
+            &secrets,
+            &our_identity.public_key().0,
+            &their_bundle.identity_key.0,
+        );
 
         Ok(X4DHInitResult {
             root_key,
@@ -97,6 +114,7 @@ impl X4DH {
     }
 
     /// Responder (Bob) computes shared secret from Alice's prekey message.
+    /// C4: `their_identity_ed` and `their_dh_signature` verify Alice's DH key binding.
     pub fn respond(
         _our_identity: &Ed25519KeyPair,
         our_identity_dh: &X25519KeyPair,
@@ -104,9 +122,20 @@ impl X4DH {
         our_one_time_prekey: Option<&X25519KeyPair>,
         our_pq_secret_key: &PqSecretKey,
         their_identity_dh_key: &PublicKey,
+        their_identity_ed: Option<&IdentityPublicKey>,
+        their_dh_signature: Option<&[u8]>,
         their_ephemeral: &PublicKey,
         pq_ciphertext: &PqCiphertext,
     ) -> Result<X4DHResponseResult> {
+        // C4: Verify Alice's identity_dh_key is bound to her Ed25519 identity
+        if let (Some(ed_key), Some(sig)) = (their_identity_ed, their_dh_signature) {
+            if !sig.is_empty() {
+                let mut dh_bind_msg = Vec::new();
+                dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
+                dh_bind_msg.extend_from_slice(&their_identity_dh_key.0);
+                Ed25519KeyPair::verify(ed_key, &dh_bind_msg, sig)?;
+            }
+        }
         // DH1: SPK_B × IK_A (X25519 identity DH key)
         let dh1 = our_signed_prekey.dh(their_identity_dh_key)?;
 
@@ -132,7 +161,16 @@ impl X4DH {
         }
         secrets.push(&pq_ss);
 
-        let (root_key, chain_key) = kdf::kdf_session(&secrets);
+        // M8: Bind session to both parties' identities (initiator=them, responder=us)
+        // Use their_identity_ed for Alice's identity (initiator), our identity for Bob (responder)
+        let their_ed = their_identity_ed
+            .map(|k| k.0.as_slice())
+            .unwrap_or(&[0u8; 32]);
+        let (root_key, chain_key) = kdf::kdf_session(
+            &secrets,
+            their_ed,
+            &_our_identity.public_key().0,
+        );
 
         Ok(X4DHResponseResult {
             root_key,

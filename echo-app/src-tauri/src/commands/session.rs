@@ -26,6 +26,23 @@ pub async fn establish_session(
         id.clone().ok_or("Not signed in")?
     };
 
+    // If poller already established a session (from a received PreKey message),
+    // don't overwrite it with a new independent session — that breaks bidirectional messaging.
+    let recipient_uuid: uuid::Uuid = device_id.parse().map_err(|e| format!("Invalid UUID: {}", e))?;
+    tracing::info!("⚡ SESSION establish_session called for {} (our_id={})", recipient_uuid, identity_state.device_id);
+    {
+        let vault = state.vault.lock().unwrap();
+        if vault.session_exists(recipient_uuid) {
+            tracing::info!("⚡ SESSION already exists for {} — skipping X4DH", recipient_uuid);
+            app.emit(events::EVENT_SESSION_ESTABLISHED, &device_id).ok();
+            return Ok(SessionResult {
+                device_id,
+                verified: true,
+            });
+        }
+    }
+    tracing::info!("⚡ SESSION no existing session for {} — starting X4DH initiate", recipient_uuid);
+
     let http = {
         let h = state.http.lock().unwrap();
         match h.as_ref() {
@@ -38,7 +55,7 @@ pub async fn establish_session(
         }
     };
 
-    let recipient_device: uuid::Uuid = device_id.parse().map_err(|e| format!("Invalid UUID: {}", e))?;
+    let recipient_device = recipient_uuid;
 
     // Read cached STH and server pubkey from vault (lock + release before await)
     let (last_sth, server_pubkey) = {
@@ -144,6 +161,14 @@ pub async fn establish_session(
             .save_session(recipient_device, &ratchet_state, &meta)
             .map_err(|e| e.to_string())?;
     }
+
+    tracing::info!(
+        "⚡ SESSION established for {} — initiator, needs_prekey=true, send_chain={}, recv_chain={}, dh_num={}",
+        recipient_device,
+        ratchet_state.sending_chain_key.is_some(),
+        ratchet_state.receiving_chain_key.is_some(),
+        ratchet_state.dh_ratchet_number
+    );
 
     let result = SessionResult {
         device_id: device_id.clone(),

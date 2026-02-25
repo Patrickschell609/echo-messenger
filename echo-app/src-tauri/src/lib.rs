@@ -14,7 +14,6 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::auth::create_account,
@@ -36,6 +35,8 @@ pub fn run() {
             commands::contacts::add_buddy,
             commands::contacts::remove_buddy,
             commands::contacts::list_buddies,
+            commands::contacts::lookup_code,
+            commands::contacts::get_short_code,
             commands::profile::update_profile,
             commands::profile::fetch_profile,
             commands::groups::create_group,

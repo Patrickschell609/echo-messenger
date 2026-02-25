@@ -5,7 +5,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const PROTOCOL_VERSION: u8 = 1;
 
 /// Max skipped message keys to store per session
-pub const MAX_SKIP: u32 = 1000;
+pub const MAX_SKIP: u32 = 200;
 
 /// Messages between PQ epoch ratchets
 pub const PQ_RATCHET_INTERVAL: u32 = 100;
@@ -73,6 +73,10 @@ pub struct DeviceId(pub [u8; 16]);
 pub struct PrekeyBundle {
     pub identity_key: IdentityPublicKey,
     pub identity_dh_key: PublicKey,              // X25519 identity key for DH operations
+    /// Ed25519 signature binding identity_dh_key to identity_key (C3).
+    /// sign("echo-dh-binding:" || identity_dh_key_bytes)
+    #[serde(default)]
+    pub identity_dh_key_signature: Vec<u8>,
     pub signed_prekey: PublicKey,
     pub signed_prekey_signature: Vec<u8>,
     pub signed_prekey_id: u32,

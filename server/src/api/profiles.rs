@@ -31,6 +31,7 @@ pub async fn update_profile(
         "POST",
         "/v1/profile/update",
         &state.db,
+        &state.redis,
     )
     .await?;
 
@@ -68,7 +69,7 @@ pub async fn get_profile(
 ) -> Result<Json<ProfileResponse>, ApiError> {
     // Authenticate caller (prevents anonymous enumeration)
     let auth_path = format!("/v1/profile/{}", target_device_id);
-    authenticate_device(&headers, "GET", &auth_path, &state.db).await?;
+    authenticate_device(&headers, "GET", &auth_path, &state.db, &state.redis).await?;
 
     let row: Option<(Option<String>, Option<String>)> =
         sqlx::query_as("SELECT display_name, bio FROM devices WHERE id = $1")
@@ -81,6 +82,47 @@ pub async fn get_profile(
             device_id: target_device_id.to_string(),
             display_name,
             bio,
+        })),
+        None => Err(ApiError::NotFound("device not found".into())),
+    }
+}
+
+/// Response for short code lookup.
+#[derive(Serialize)]
+pub struct LookupResponse {
+    pub device_id: String,
+    pub display_name: Option<String>,
+    pub short_code: String,
+}
+
+/// GET /v1/lookup/{code} (authenticated) — resolve a short code to a device.
+pub async fn lookup_by_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<Json<LookupResponse>, ApiError> {
+    // Authenticate caller (prevents anonymous enumeration)
+    let normalized = code.replace('-', "").to_uppercase();
+    let auth_path = format!("/v1/lookup/{}", code);
+    authenticate_device(&headers, "GET", &auth_path, &state.db, &state.redis).await?;
+
+    // Validate format: 8 alphanumeric chars from unambiguous alphabet
+    if normalized.len() != 8 || !normalized.chars().all(|c| "ABCDEFGHJKMNPQRSTUVWXYZ23456789".contains(c)) {
+        return Err(ApiError::BadRequest("invalid short code format".into()));
+    }
+
+    let row: Option<(uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, display_name, short_code FROM devices WHERE UPPER(short_code) = $1"
+    )
+    .bind(&normalized)
+    .fetch_optional(&state.db)
+    .await?;
+
+    match row {
+        Some((device_id, display_name, short_code)) => Ok(Json(LookupResponse {
+            device_id: device_id.to_string(),
+            display_name,
+            short_code: short_code.unwrap_or(normalized),
         })),
         None => Err(ApiError::NotFound("device not found".into())),
     }

@@ -26,7 +26,7 @@ pub async fn create_group(
     headers: HeaderMap,
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<Json<GroupResponse>, ApiError> {
-    let device_id = authenticate_device(&headers, "POST", "/v1/groups", &state.db).await?;
+    let device_id = authenticate_device(&headers,"POST", "/v1/groups", &state.db, &state.redis).await?;
 
     let name = req.name.trim();
     if name.is_empty() || name.len() > 128 {
@@ -92,7 +92,7 @@ pub async fn list_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<GroupResponse>>, ApiError> {
-    let device_id = authenticate_device(&headers, "GET", "/v1/groups", &state.db).await?;
+    let device_id = authenticate_device(&headers,"GET", "/v1/groups", &state.db, &state.redis).await?;
 
     let rows: Vec<(Uuid, Option<String>, i64)> = sqlx::query_as(
         r#"
@@ -138,7 +138,7 @@ pub async fn send_group_message(
     Json(req): Json<SendGroupMessageRequest>,
 ) -> Result<Json<SendGroupMessageResponse>, ApiError> {
     let path = format!("/v1/groups/{}/send", group_id);
-    let device_id = authenticate_device(&headers, "POST", &path, &state.db).await?;
+    let device_id = authenticate_device(&headers,"POST", &path, &state.db, &state.redis).await?;
 
     // Verify sender is a member
     let member: Option<(i16,)> = sqlx::query_as(
@@ -160,11 +160,13 @@ pub async fn send_group_message(
         return Err(ApiError::PayloadTooLarge("payload too large".into()));
     }
 
+    // SECURITY: Do NOT store sender_device_id in the database — admin=0 means the server
+    // must not know who sent a group message. The sender identity is inside the encrypted
+    // payload, recoverable only by group members with the group session key.
     let (msg_id,): (i64,) = sqlx::query_as(
-        "INSERT INTO group_messages (group_id, sender_device_id, payload) VALUES ($1, $2, $3) RETURNING id",
+        "INSERT INTO group_messages (group_id, payload) VALUES ($1, $2) RETURNING id",
     )
     .bind(group_id)
-    .bind(device_id)
     .bind(&payload)
     .fetch_one(&state.db)
     .await?;
@@ -188,7 +190,7 @@ pub async fn receive_group_messages(
     Path(group_id): Path<Uuid>,
 ) -> Result<Json<Vec<GroupQueuedMessage>>, ApiError> {
     let path = format!("/v1/groups/{}/messages", group_id);
-    let device_id = authenticate_device(&headers, "GET", &path, &state.db).await?;
+    let device_id = authenticate_device(&headers,"GET", &path, &state.db, &state.redis).await?;
 
     // Verify membership
     let member: Option<(i16,)> = sqlx::query_as(
@@ -268,7 +270,7 @@ pub async fn add_group_member(
     Json(req): Json<AddMemberRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let path = format!("/v1/groups/{}/members", group_id);
-    let device_id = authenticate_device(&headers, "POST", &path, &state.db).await?;
+    let device_id = authenticate_device(&headers,"POST", &path, &state.db, &state.redis).await?;
 
     // Verify caller is admin
     let role: Option<(i16,)> = sqlx::query_as(
@@ -319,7 +321,7 @@ pub async fn leave_group(
     Path(group_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let path = format!("/v1/groups/{}/leave", group_id);
-    let device_id = authenticate_device(&headers, "POST", &path, &state.db).await?;
+    let device_id = authenticate_device(&headers,"POST", &path, &state.db, &state.redis).await?;
 
     sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND device_id = $2")
         .bind(group_id)
@@ -350,7 +352,7 @@ pub async fn get_group_members(
     Path(group_id): Path<Uuid>,
 ) -> Result<Json<Vec<GroupMemberInfo>>, ApiError> {
     let path = format!("/v1/groups/{}/members", group_id);
-    let device_id = authenticate_device(&headers, "GET", &path, &state.db).await?;
+    let device_id = authenticate_device(&headers,"GET", &path, &state.db, &state.redis).await?;
 
     let member: Option<(i16,)> = sqlx::query_as(
         "SELECT role FROM group_members WHERE group_id = $1 AND device_id = $2",

@@ -109,6 +109,9 @@ pub enum WireMessage {
         sender_identity_key: Vec<u8>,
         /// Alice's X25519 identity DH public key
         sender_identity_dh_key: Vec<u8>,
+        /// Ed25519 signature binding identity_dh_key to identity_key (C4)
+        #[serde(default)]
+        sender_identity_dh_signature: Vec<u8>,
         /// Ephemeral X25519 public key
         ephemeral_public: Vec<u8>,
         /// PQ KEM ciphertext

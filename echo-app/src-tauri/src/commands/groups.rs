@@ -9,15 +9,19 @@ use crate::state::{AppState, GroupChatMessage, GroupInfo};
 
 /// Helper: build an authenticated HttpClient from app state.
 fn build_http(state: &AppState) -> Result<HttpClient, String> {
-    let identity = state.identity.lock().unwrap();
-    let id_state = identity.as_ref().ok_or("not signed in")?;
+    let (device_id, ed_bytes) = {
+        let identity = state.identity.lock().unwrap();
+        let id_state = identity.as_ref().ok_or("not signed in")?;
+        let mut ed = [0u8; 32];
+        ed.copy_from_slice(&id_state.identity_ed_private);
+        (id_state.device_id, ed)
+    }; // identity lock released
+
     let http = state.http.lock().unwrap();
     let http_ref = http.as_ref().ok_or("no http client")?;
-    let mut ed_bytes = [0u8; 32];
-    ed_bytes.copy_from_slice(&id_state.identity_ed_private);
     Ok(HttpClient::with_auth(
         http_ref.base_url(),
-        id_state.device_id,
+        device_id,
         &ed_bytes,
     ))
 }
@@ -253,6 +257,10 @@ async fn distribute_sender_key(
                             let id = state.identity.lock().unwrap();
                             id.as_ref().map(|s| s.identity_dh_public.clone()).unwrap_or_default()
                         },
+                        sender_identity_dh_signature: {
+                            let id = state.identity.lock().unwrap();
+                            id.as_ref().map(|s| echo_client::identity::sign_identity_dh_binding(s)).unwrap_or_default()
+                        },
                         ephemeral_public: meta.ephemeral_public.clone(),
                         pq_ciphertext: meta.pq_ciphertext.clone(),
                         used_one_time_prekey_id: meta.used_one_time_prekey_id,
@@ -284,14 +292,19 @@ async fn distribute_sender_key(
                     {
                         let envelope = bincode::serialize(&sealed).unwrap_or_default();
 
+                        // Lock identity first, then http (same order as everywhere else to avoid deadlock)
                         let http = {
+                            let id = state.identity.lock().unwrap();
+                            let id_state = match id.as_ref() {
+                                Some(s) => s,
+                                None => continue,
+                            };
+                            let mut ed_bytes = [0u8; 32];
+                            ed_bytes.copy_from_slice(&id_state.identity_ed_private);
+                            let device_id = id_state.device_id;
                             let h = state.http.lock().unwrap();
                             h.as_ref().map(|c| {
-                                let id = state.identity.lock().unwrap();
-                                let id_state = id.as_ref().unwrap();
-                                let mut ed_bytes = [0u8; 32];
-                                ed_bytes.copy_from_slice(&id_state.identity_ed_private);
-                                HttpClient::with_auth(c.base_url(), id_state.device_id, &ed_bytes)
+                                HttpClient::with_auth(c.base_url(), device_id, &ed_bytes)
                             })
                         };
 

@@ -8,6 +8,9 @@ use echo_client::identity::{self, IdentityStore};
 use echo_client::transparency;
 use echo_client::wire::WireMessage;
 
+#[cfg(feature = "e2e")]
+mod e2e;
+
 #[derive(Parser)]
 #[command(name = "echo", about = "ECHO Messenger CLI — post-quantum secure messaging")]
 struct Cli {
@@ -58,6 +61,17 @@ enum Commands {
 
     /// Monitor own key transparency — verify server has correct keys
     Monitor,
+
+    /// [TEST ONLY] Run full E2E test: 2 identities, short code lookup, bidirectional messaging
+    #[cfg(feature = "e2e")]
+    TestE2e {
+        /// First invite code
+        #[arg(long)]
+        invite1: String,
+        /// Second invite code
+        #[arg(long)]
+        invite2: String,
+    },
 }
 
 #[tokio::main]
@@ -91,6 +105,10 @@ async fn main() -> Result<()> {
             cmd_recv(&auth_http, &store).await
         }
         Commands::Monitor => cmd_monitor(&http, &store).await,
+        #[cfg(feature = "e2e")]
+        Commands::TestE2e { invite1, invite2 } => {
+            e2e::run_e2e(&cli.server, &invite1, &invite2).await
+        }
     }
 }
 
@@ -103,7 +121,7 @@ async fn cmd_register(http: &HttpClient, store: &IdentityStore, invite: &str) ->
     let keys = identity::KeyMaterial::generate();
 
     println!("Uploading prekey bundle...");
-    let (device_id, _sender_cert) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await?;
+    let (device_id, _sender_cert, _short_code) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await?;
     println!("Device: {}", device_id);
 
     store.save(account_id, device_id, &keys)?;
@@ -123,7 +141,7 @@ fn cmd_whoami(store: &IdentityStore) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_session(
+pub(crate) async fn cmd_session(
     http: &HttpClient,
     store: &IdentityStore,
     device_str: &str,
@@ -229,7 +247,7 @@ async fn cmd_session(
     Ok(())
 }
 
-async fn cmd_send(
+pub(crate) async fn cmd_send(
     http: &HttpClient,
     store: &IdentityStore,
     to_str: &str,
@@ -248,6 +266,7 @@ async fn cmd_send(
         WireMessage::PreKey {
             sender_identity_key: state.identity_ed_public.clone(),
             sender_identity_dh_key: state.identity_dh_public.clone(),
+            sender_identity_dh_signature: identity::sign_identity_dh_binding(&state),
             ephemeral_public: session_meta.ephemeral_public.clone(),
             pq_ciphertext: session_meta.pq_ciphertext.clone(),
             used_one_time_prekey_id: session_meta.used_one_time_prekey_id,
@@ -286,7 +305,7 @@ async fn cmd_send(
     Ok(())
 }
 
-async fn cmd_recv(
+pub(crate) async fn cmd_recv(
     http: &HttpClient,
     store: &IdentityStore,
 ) -> Result<()> {
@@ -315,10 +334,24 @@ async fn cmd_recv(
             }
         };
 
+        // H1: Load server transparency key (required for cert verification)
+        let server_pk: [u8; 32] = match store.load_server_transparency_key() {
+            Some(hex_str) => {
+                let bytes = hex::decode(&hex_str)?;
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                arr
+            }
+            None => {
+                eprintln!("  [msg {}] no server transparency key — cannot verify cert", qm.id);
+                continue;
+            }
+        };
+
         let (sender_cert, inner) = match echo_crypto::sealed_sender::unseal_message(
             &keys.identity_dh,
             &envelope,
-            None, // CLI: no server key verification yet
+            &server_pk,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -343,6 +376,7 @@ async fn cmd_recv(
             WireMessage::PreKey {
                 sender_identity_key,
                 sender_identity_dh_key,
+                sender_identity_dh_signature,
                 ephemeral_public,
                 pq_ciphertext,
                 used_one_time_prekey_id,
@@ -353,7 +387,7 @@ async fn cmd_recv(
                 ratchet_header,
                 encrypted_header,
                 ciphertext,
-                Some((sender_identity_key, sender_identity_dh_key, ephemeral_public, pq_ciphertext, used_one_time_prekey_id)),
+                Some((sender_identity_key, sender_identity_dh_key, sender_identity_dh_signature, ephemeral_public, pq_ciphertext, used_one_time_prekey_id)),
             ),
             WireMessage::Normal {
                 ratchet_header,
@@ -394,11 +428,21 @@ async fn cmd_recv(
                     eprintln!("  [msg {}] decrypt failed: {}", qm.id, e);
                 }
             }
-        } else if let Some((sender_ik, sender_dh_key, ephemeral_pub, pq_ct, _otpk_id)) = prekey_data {
+        } else if let Some((sender_ik, sender_dh_key, sender_dh_sig, ephemeral_pub, pq_ct, _otpk_id)) = prekey_data {
             let mut eph = [0u8; 32];
             eph.copy_from_slice(&ephemeral_pub);
             let mut sdk = [0u8; 32];
             sdk.copy_from_slice(&sender_dh_key);
+
+            // C4: Reconstruct sender Ed25519 identity for DH binding verification
+            let sender_ed_key = if sender_ik.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&sender_ik);
+                Some(echo_crypto::IdentityPublicKey(arr))
+            } else {
+                None
+            };
+            let sender_dh_sig_ref = if sender_dh_sig.is_empty() { None } else { Some(sender_dh_sig.as_slice()) };
 
             let otp_keypair = _otpk_id.and_then(|id| {
                 keys.one_time_prekeys.iter().find(|(kid, _)| *kid == id).map(|(_, kp)| kp)
@@ -411,6 +455,8 @@ async fn cmd_recv(
                 otp_keypair,
                 &keys.pq_sk,
                 &echo_crypto::PublicKey(sdk),
+                sender_ed_key.as_ref(),
+                sender_dh_sig_ref,
                 &echo_crypto::PublicKey(eph),
                 &echo_crypto::PqCiphertext(pq_ct.clone()),
             ) {
@@ -442,16 +488,17 @@ async fn cmd_recv(
                 my_dh_public: keys.signed_prekey.public_key(),
                 my_dh_private: Some(keys.signed_prekey.private_key_bytes()),
                 peer_dh_public: Some(enc_msg.header.dh_public.clone()),
-                root_key: x4dh_result.root_key,
+                root_key: x4dh_result.root_key.clone(),
                 sending_chain_key: None,
                 receiving_chain_key: Some(x4dh_result.chain_key),
                 send_message_number: 0,
                 recv_message_number: 0,
                 prev_sending_chain_length: 0,
-                sending_header_key: None,
-                receiving_header_key: None,
-                next_sending_header_key: None,
-                next_receiving_header_key: None,
+                // M11: Derive initial header keys (responder swaps send/recv direction)
+                sending_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, false)),
+                receiving_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, true)),
+                next_sending_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, false)),
+                next_receiving_header_key: Some(echo_crypto::crypto::kdf::derive_header_key(&x4dh_result.root_key, true)),
                 skipped_keys: std::collections::HashMap::new(),
                 processed_ids: HashSet::new(),
                 processed_order: VecDeque::new(),
@@ -464,7 +511,7 @@ async fn cmd_recv(
                 ephemeral_public: ephemeral_pub,
                 pq_ciphertext: pq_ct,
                 used_one_time_prekey_id: None,
-                needs_prekey_message: true,
+                needs_prekey_message: false, // Responder: session from recv, never send PreKey
             };
 
             let mut session = echo_crypto::ratchet::TripleRatchetSession::new(ratchet_state);

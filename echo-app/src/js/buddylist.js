@@ -7,6 +7,7 @@ const BuddyList = {
   createGroupOpen: false,
   profileCache: {},       // device_id -> { display_name, bio }
   _lastProfileFetch: 0,  // timestamp of last profile sync
+  _shortCode: null,       // own short code (e.g. "A7X2KM9P")
 
   async render() {
     // Stop any existing timer
@@ -16,6 +17,12 @@ const BuddyList = {
     }
 
     this.addFormOpen = false;
+
+    // Load short code if not already cached
+    if (!this._shortCode) {
+      try { this._shortCode = await API.getShortCode(); } catch (_) {}
+    }
+
     const app = document.getElementById('app');
     const deviceId = App.deviceId || '...';
     const shortId = deviceId.length > 12 ? deviceId.substring(0, 12) + '...' : deviceId;
@@ -29,9 +36,10 @@ const BuddyList = {
 
         <div class="my-id-section">
           <span class="my-id-name" id="myDisplayName" title="Click to edit">${esc(this.profileCache[deviceId]?.display_name || shortId)}</span>
+          <span class="my-short-code" id="myShortCode">${this._shortCode ? this._formatCode(this._shortCode) : ''}</span>
           <button class="my-id-btn" id="btnEditName">Edit</button>
           <button class="my-id-btn" id="btnQR">QR</button>
-          <button class="my-id-btn" id="btnCopy">Copy ID</button>
+          <button class="my-id-btn" id="btnCopy">${this._shortCode ? 'Copy Code' : 'Copy ID'}</button>
           <button class="my-id-btn" id="btnInvite">Invite</button>
         </div>
 
@@ -41,7 +49,7 @@ const BuddyList = {
 
         <div class="add-buddy-form" id="addBuddyForm">
           <div class="input-row">
-            <input type="text" class="input-field" id="addBuddyId" placeholder="Friend's ID...">
+            <input type="text" class="input-field" id="addBuddyId" placeholder="Friend's code (e.g. A7X2-KM9P)">
             <button class="btn btn-primary" id="btnAddBuddy">Add</button>
           </div>
           <div class="add-buddy-name-row">
@@ -82,11 +90,13 @@ const BuddyList = {
 
   bind() {
     document.getElementById('btnQR').addEventListener('click', () => {
-      QRCode.showModal(App.deviceId);
+      const code = this._shortCode ? this._formatCode(this._shortCode) : App.deviceId;
+      QRCode.showModal(code, this._shortCode ? 'My Code' : undefined);
     });
 
     document.getElementById('btnCopy').addEventListener('click', () => {
-      navigator.clipboard.writeText(App.deviceId).catch(() => {});
+      const text = this._shortCode ? this._formatCode(this._shortCode) : App.deviceId;
+      navigator.clipboard.writeText(text).catch(() => {});
       App.toastSuccess('Copied to clipboard');
     });
 
@@ -233,19 +243,51 @@ const BuddyList = {
     });
   },
 
+  _isShortCode(value) {
+    // Short code: 8-9 chars (with optional hyphen), from unambiguous alphabet
+    const stripped = value.replace(/-/g, '').toUpperCase();
+    return stripped.length === 8 && /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]+$/.test(stripped);
+  },
+
+  _isUuid(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+  },
+
+  _formatCode(code) {
+    // Format 8-char code as XXXX-XXXX
+    const clean = code.replace(/-/g, '').toUpperCase();
+    if (clean.length === 8) return clean.substring(0, 4) + '-' + clean.substring(4);
+    return code;
+  },
+
   async doAddBuddy() {
     const input = document.getElementById('addBuddyId');
     const nameInput = document.getElementById('addBuddyName');
-    const deviceId = input.value.trim();
+    const value = input.value.trim();
     const displayName = nameInput?.value?.trim() || '';
 
-    if (!deviceId) {
-      App.toastError('Paste a device UUID');
+    if (!value) {
+      App.toastError('Enter a short code or device UUID');
       return;
     }
 
     try {
-      await API.addBuddy(deviceId, displayName);
+      let deviceId = value;
+      let resolvedName = displayName;
+
+      if (this._isShortCode(value)) {
+        // Resolve short code to device ID
+        const lookup = await API.lookupCode(value);
+        deviceId = lookup.device_id;
+        if (!resolvedName && lookup.display_name) {
+          resolvedName = lookup.display_name;
+        }
+      } else if (!this._isUuid(value)) {
+        App.toastError('Enter a valid short code (e.g. A7X2-KM9P) or UUID');
+        return;
+      }
+
+      await API.addBuddy(deviceId, resolvedName);
       input.value = '';
       if (nameInput) nameInput.value = '';
 

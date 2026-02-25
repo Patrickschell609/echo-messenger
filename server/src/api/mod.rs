@@ -91,22 +91,25 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
-/// Timestamp tolerance for Ed25519 auth signatures: +/- 5 minutes.
-const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
+/// Timestamp tolerance for Ed25519 auth signatures: +/- 2 minutes (tightened from 5).
+const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 120;
 
 /// Authenticate a device via Ed25519 signed request headers.
 ///
 /// Client sends:
 ///   X-Device-ID: <uuid>
 ///   X-Auth-Timestamp: <unix_secs>
-///   X-Auth-Signature: <hex(Ed25519.sign(priv, device_id || timestamp || method || path))>
+///   X-Auth-Nonce: <hex(16 random bytes)> — prevents replay attacks
+///   X-Auth-Signature: <hex(Ed25519.sign(priv, device_id || timestamp || nonce || method || path || body_hash))>
 ///
-/// Server: lookup device's identity_key from DB, verify signature, check timestamp.
+/// Server: lookup device's identity_key from DB, verify signature, check timestamp,
+/// reject seen nonces within the timestamp window.
 pub async fn authenticate_device(
     headers: &axum::http::HeaderMap,
     method: &str,
     path: &str,
     db: &PgPool,
+    redis: &redis::Client,
 ) -> Result<uuid::Uuid, ApiError> {
     let device_id_str = headers
         .get("x-device-id")
@@ -126,6 +129,17 @@ pub async fn authenticate_device(
     let timestamp: u64 = timestamp_str
         .parse()
         .map_err(|_| ApiError::BadRequest("invalid timestamp".into()))?;
+
+    // Require nonce header for replay protection
+    let nonce_hex = headers
+        .get("x-auth-nonce")
+        .ok_or(ApiError::Unauthorized)?
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("invalid nonce header".into()))?;
+
+    if hex::decode(nonce_hex).map_or(true, |b| b.len() != 16) {
+        return Err(ApiError::BadRequest("nonce must be 32 hex chars (16 bytes)".into()));
+    }
 
     let sig_hex = headers
         .get("x-auth-signature")
@@ -151,6 +165,30 @@ pub async fn authenticate_device(
         return Err(ApiError::Unauthorized);
     }
 
+    // Check nonce uniqueness (reject replays within timestamp window)
+    let nonce_key = format!("auth:nonce:{}", nonce_hex);
+    match redis.get_multiplexed_async_connection().await {
+        Ok(mut conn) => {
+            let was_set: bool = redis::cmd("SET")
+                .arg(&nonce_key)
+                .arg("1")
+                .arg("NX")                       // only set if not exists
+                .arg("EX")
+                .arg(AUTH_TIMESTAMP_TOLERANCE_SECS * 2) // TTL = 2x window
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(false);
+            if !was_set {
+                return Err(ApiError::Unauthorized); // nonce already seen = replay
+            }
+        }
+        Err(e) => {
+            // Fail closed — if Redis is down, reject auth (don't allow replay)
+            tracing::error!("redis unavailable for nonce check, rejecting: {}", e);
+            return Err(ApiError::Internal("auth service unavailable".into()));
+        }
+    }
+
     // Look up the device's identity_key (Ed25519 public key) from DB
     let row: Option<(Vec<u8>,)> = sqlx::query_as(
         "SELECT identity_key FROM devices WHERE id = $1"
@@ -165,12 +203,20 @@ pub async fn authenticate_device(
         return Err(ApiError::Internal("stored identity_key wrong size".into()));
     }
 
-    // Build the message that was signed: device_id || timestamp || method || path
+    // Build the signed message: device_id || timestamp || nonce || method || path || body_hash
+    // body_hash is SHA-256 of the request body (empty hash for GET)
+    let body_hash_hex = headers
+        .get("x-auth-body-hash")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); // SHA-256 of empty
+
     let mut message = Vec::new();
     message.extend_from_slice(device_id_str.as_bytes());
     message.extend_from_slice(timestamp_str.as_bytes());
+    message.extend_from_slice(nonce_hex.as_bytes());
     message.extend_from_slice(method.as_bytes());
     message.extend_from_slice(path.as_bytes());
+    message.extend_from_slice(body_hash_hex.as_bytes());
 
     // Verify Ed25519 signature
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -191,13 +237,3 @@ pub async fn authenticate_device(
     Ok(device_id)
 }
 
-/// Legacy extract for POC endpoints that don't need full auth yet.
-/// Keep for `extract_device_id` backward compat during transition.
-pub fn extract_device_id(headers: &axum::http::HeaderMap) -> Result<uuid::Uuid, ApiError> {
-    let val = headers
-        .get("x-device-id")
-        .ok_or(ApiError::Unauthorized)?
-        .to_str()
-        .map_err(|_| ApiError::BadRequest("invalid device id header".into()))?;
-    uuid::Uuid::parse_str(val).map_err(|_| ApiError::BadRequest("invalid device id".into()))
-}

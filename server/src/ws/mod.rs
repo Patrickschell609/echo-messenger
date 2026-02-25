@@ -22,6 +22,7 @@ pub async fn websocket_handler(
 struct WsAuthMessage {
     device_id: String,
     timestamp: String,
+    nonce: String, // 16-byte random hex — prevents replay
     signature: String,
 }
 
@@ -51,8 +52,8 @@ struct WsAuthResponse {
     error: Option<String>,
 }
 
-/// Timestamp tolerance for WebSocket auth: +/- 5 minutes.
-const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
+/// Timestamp tolerance for WebSocket auth: +/- 2 minutes (tightened from 5).
+const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 120;
 
 /// Heartbeat interval.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -234,6 +235,34 @@ async fn authenticate_ws(socket: &mut WebSocket, state: &AppState) -> Result<Uui
         return Err("timestamp expired".into());
     }
 
+    // Validate and check nonce for replay protection
+    let nonce_bytes = hex::decode(&auth.nonce).map_err(|_| "invalid nonce hex".to_string())?;
+    if nonce_bytes.len() != 16 {
+        return Err("nonce must be 16 bytes".into());
+    }
+
+    // Check nonce uniqueness via Redis (same pattern as HTTP auth)
+    let nonce_key = format!("auth:ws:nonce:{}", auth.nonce);
+    match state.redis.get_multiplexed_async_connection().await {
+        Ok(mut conn) => {
+            let was_set: bool = redis::cmd("SET")
+                .arg(&nonce_key)
+                .arg("1")
+                .arg("NX")
+                .arg("EX")
+                .arg(AUTH_TIMESTAMP_TOLERANCE_SECS * 2)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(false);
+            if !was_set {
+                return Err("nonce already used (replay)".into());
+            }
+        }
+        Err(e) => {
+            return Err(format!("auth service unavailable: {}", e));
+        }
+    }
+
     // Look up identity key
     let row: Option<(Vec<u8>,)> =
         sqlx::query_as("SELECT identity_key FROM devices WHERE id = $1")
@@ -248,10 +277,11 @@ async fn authenticate_ws(socket: &mut WebSocket, state: &AppState) -> Result<Uui
         return Err("stored identity_key wrong size".into());
     }
 
-    // Build the signed message: device_id || timestamp || "GET" || "/v1/ws"
+    // Build the signed message: device_id || timestamp || nonce || "GET" || "/v1/ws"
     let mut message = Vec::new();
     message.extend_from_slice(auth.device_id.as_bytes());
     message.extend_from_slice(auth.timestamp.as_bytes());
+    message.extend_from_slice(auth.nonce.as_bytes());
     message.extend_from_slice(b"GET");
     message.extend_from_slice(b"/v1/ws");
 

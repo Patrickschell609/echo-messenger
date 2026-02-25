@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
 
 use crate::types::*;
 
 /// Complete Triple Ratchet state for one session endpoint.
-/// Must be stored encrypted (SQLCipher) and zeroized when replaced.
+/// Must be stored encrypted (SQLCipher) and zeroized on drop (H3).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RatchetState {
     // Identity
@@ -80,13 +80,37 @@ impl RatchetState {
     }
 
     /// Clean up processed IDs to prevent unbounded growth.
+    /// SECURITY: The processed_ids window must cover at least as many DH ratchets as
+    /// skipped_keys retains (100), otherwise a replayed skipped message could be accepted
+    /// after its processed_id is evicted but its skipped key is still present.
+    /// We evict processed_ids by DH ratchet number (same unit as skipped_keys) to keep them aligned.
     pub fn cleanup_processed_ids(&mut self) {
-        const MAX_PROCESSED: usize = 10_000;
+        const MAX_PROCESSED: usize = 50_000; // raised from 10K to cover skipped key window
+
         if self.processed_ids.len() > MAX_PROCESSED {
-            let drain_count = self.processed_ids.len() - MAX_PROCESSED / 2;
-            for _ in 0..drain_count {
+            // Evict entries older than the skipped_keys cutoff to stay aligned
+            let ratchet_cutoff = if self.dh_ratchet_number > 100 {
+                self.dh_ratchet_number - 100
+            } else {
+                0
+            };
+
+            // Remove processed_ids that are older than the skipped key retention window
+            self.processed_order.retain(|&tuple| {
+                if tuple.1 < ratchet_cutoff {
+                    self.processed_ids.remove(&tuple);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // If still over limit, do FIFO eviction as fallback
+            while self.processed_ids.len() > MAX_PROCESSED {
                 if let Some(old) = self.processed_order.pop_front() {
                     self.processed_ids.remove(&old);
+                } else {
+                    break;
                 }
             }
         }
@@ -104,5 +128,33 @@ impl RatchetState {
             self.processed_order.push_back(tuple);
         }
         self.cleanup_processed_ids();
+    }
+}
+
+/// H3: Zeroize all sensitive key material on drop.
+/// Cannot use derive(ZeroizeOnDrop) because HashMap/HashSet/VecDeque don't impl Zeroize.
+impl Drop for RatchetState {
+    fn drop(&mut self) {
+        // Symmetric keys
+        self.root_key.zeroize();
+        if let Some(ref mut k) = self.sending_chain_key { k.zeroize(); }
+        if let Some(ref mut k) = self.receiving_chain_key { k.zeroize(); }
+
+        // DH private key
+        if let Some(ref mut k) = self.my_dh_private { k.zeroize(); }
+
+        // Header keys
+        if let Some(ref mut k) = self.sending_header_key { k.zeroize(); }
+        if let Some(ref mut k) = self.receiving_header_key { k.zeroize(); }
+        if let Some(ref mut k) = self.next_sending_header_key { k.zeroize(); }
+        if let Some(ref mut k) = self.next_receiving_header_key { k.zeroize(); }
+
+        // PQ secret key
+        if let Some(ref mut k) = self.my_epoch_sk { k.zeroize(); }
+
+        // Skipped message keys (each MessageKey implements Zeroize)
+        for (_, key) in self.skipped_keys.iter_mut() {
+            key.zeroize();
+        }
     }
 }

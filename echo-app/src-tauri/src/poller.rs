@@ -180,19 +180,26 @@ async fn try_ws_connect(
 async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedMessage) {
     let state = app.state::<AppState>();
 
+    tracing::info!("▶ MSG #{} — begin processing (envelope len={})", qm.id, qm.envelope.len());
+
     let identity_state = {
         let id = state.identity.lock().unwrap();
         match id.as_ref() {
             Some(s) => s.clone(),
-            None => return,
+            None => {
+                tracing::error!("▶ MSG #{} — NO IDENTITY STATE, dropping", qm.id);
+                return;
+            }
         }
     };
 
+    tracing::info!("▶ MSG #{} — our device_id={}", qm.id, identity_state.device_id);
     let keys = identity_state.reconstruct_keys();
 
     let envelope_bytes = match hex::decode(&qm.envelope) {
         Ok(b) => b,
-        Err(_) => {
+        Err(e) => {
+            tracing::error!("▶ MSG #{} — FAIL hex decode: {}", qm.id, e);
             app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: invalid envelope hex", qm.id)).ok();
             ack_single(app, qm.id).await;
             return;
@@ -201,7 +208,8 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
 
     let envelope: echo_crypto::SealedEnvelope = match bincode::deserialize(&envelope_bytes) {
         Ok(e) => e,
-        Err(_) => {
+        Err(e) => {
+            tracing::error!("▶ MSG #{} — FAIL envelope deserialize: {}", qm.id, e);
             app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: envelope deserialization failed", qm.id)).ok();
             ack_single(app, qm.id).await;
             return;
@@ -223,14 +231,30 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
         })
     };
 
+    // H1: server transparency key is now REQUIRED for cert verification
+    let server_pk = match server_pk {
+        Some(pk) => pk,
+        None => {
+            tracing::error!("▶ MSG #{} — REJECT: no server transparency key available", qm.id);
+            app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: no server key for cert verification", qm.id)).ok();
+            ack_single(app, qm.id).await;
+            return;
+        }
+    };
+
     let (sender_cert, inner) = match echo_crypto::sealed_sender::unseal_message(
         &keys.identity_dh,
         &envelope,
-        server_pk.as_ref(),
+        &server_pk,
     ) {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
+            tracing::error!("▶ MSG #{} — FAIL unseal: {:?}", qm.id, e);
             app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: unseal/cert verification failed", qm.id)).ok();
+            // ACK the message even on unseal failure to prevent infinite re-delivery loop.
+            // If unseal fails it means the message was sealed to the wrong DH key or is corrupted;
+            // retrying won't help.
+            ack_single(app, qm.id).await;
             return;
         }
     };
@@ -238,19 +262,26 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
     let sender_device_id = sender_cert.sender_device_id;
     let sender_uuid = uuid::Uuid::from_bytes(sender_device_id.0);
 
+    tracing::info!("▶ MSG #{} — unsealed OK, sender={}", qm.id, sender_uuid);
+
     let wire_msg: WireMessage = match bincode::deserialize(&inner) {
         Ok(m) => m,
-        Err(_) => {
+        Err(e) => {
+            tracing::error!("▶ MSG #{} — FAIL wire deserialize: {}", qm.id, e);
             app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: wire message corrupted", qm.id)).ok();
             ack_single(app, qm.id).await;
             return;
         }
     };
 
+    let is_prekey_msg = matches!(wire_msg, WireMessage::PreKey { .. });
+    tracing::info!("▶ MSG #{} — wire type={}", qm.id, if is_prekey_msg { "PreKey" } else { "Normal" });
+
     let (header_bytes, encrypted_header, ciphertext, prekey_data) = match wire_msg {
         WireMessage::PreKey {
             sender_identity_key,
             sender_identity_dh_key,
+            sender_identity_dh_signature,
             ephemeral_public,
             pq_ciphertext,
             used_one_time_prekey_id,
@@ -261,7 +292,7 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             ratchet_header,
             encrypted_header,
             ciphertext,
-            Some((sender_identity_key, sender_identity_dh_key, ephemeral_public, pq_ciphertext, used_one_time_prekey_id)),
+            Some((sender_identity_key, sender_identity_dh_key, sender_identity_dh_signature, ephemeral_public, pq_ciphertext, used_one_time_prekey_id)),
         ),
         WireMessage::Normal {
             ratchet_header,
@@ -291,9 +322,35 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
         vault.load_session(sender_uuid).ok()
     };
 
-    if let Some((ratchet_state, _meta)) = session_result {
+    tracing::info!(
+        "▶ MSG #{} — existing session for {}? {}{}",
+        qm.id, sender_uuid,
+        if session_result.is_some() { "YES" } else { "NO" },
+        session_result.as_ref().map(|(rs, meta)| format!(
+            " [needs_prekey={}, send_chain={}, recv_chain={}, dh_num={}, send_n={}, recv_n={}]",
+            meta.needs_prekey_message,
+            rs.sending_chain_key.is_some(),
+            rs.receiving_chain_key.is_some(),
+            rs.dh_ratchet_number,
+            rs.send_message_number,
+            rs.recv_message_number
+        )).unwrap_or_default()
+    );
+
+    let mut existing_session_handled = false;
+    // Dual-initiator race tiebreaker: when both sides auto-established and sent
+    // PreKey messages simultaneously, use device ID comparison to pick one session.
+    // The side with the higher device ID "wins" — their initiator session is kept.
+    // The "loser" replaces their session with a responder from the winner's PreKey.
+    let mut skip_session_save = false;
+
+    if let Some((ratchet_state, existing_meta)) = session_result {
         let mut session = echo_crypto::ratchet::TripleRatchetSession::new(ratchet_state);
-        if let Ok(decrypted) = session.decrypt(&enc_msg) {
+        tracing::info!("▶ MSG #{} — attempting decrypt with existing session...", qm.id);
+        match session.decrypt(&enc_msg) {
+        Ok(decrypted) => {
+            tracing::info!("▶ MSG #{} — ✓ DECRYPT OK with existing session (plaintext len={})", qm.id, decrypted.plaintext.len());
+            existing_session_handled = true;
             {
                 let vault = state.vault.lock().unwrap();
                 if vault.update_session(sender_uuid, session.export_state()).is_err() {
@@ -363,11 +420,67 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             // Send delivery receipt via WS
             send_delivery_receipt(app, sender_uuid, now);
         }
-    } else if let Some((sender_ik, sender_dh_key, ephemeral_pub, pq_ct, otpk_id)) = prekey_data {
+        Err(e) => {
+            tracing::warn!("▶ MSG #{} — ✗ DECRYPT FAILED with existing session: {}", qm.id, e);
+            if prekey_data.is_some() {
+                // Check for dual-initiator race: we already sent using our session
+                let we_already_sent = !existing_meta.needs_prekey_message;
+                tracing::info!("▶ MSG #{} — PreKey msg + existing session: we_already_sent={}, our_id={}, sender_id={}", qm.id, we_already_sent, identity_state.device_id, sender_uuid);
+                if we_already_sent {
+                    // Both sides established independently and sent PreKey messages.
+                    // Use device ID as deterministic tiebreaker: higher UUID wins.
+                    let our_device_id = identity_state.device_id;
+                    if our_device_id > sender_uuid {
+                        // We "win": decrypt this message with a temp responder session,
+                        // but keep our initiator session. The sender will receive our
+                        // PreKey and adopt our session as responder.
+                        tracing::warn!(
+                            "dual-initiator race with {} — we win (higher device_id {}), \
+                             processing message without session replacement",
+                            sender_uuid, our_device_id
+                        );
+                        skip_session_save = true;
+                    } else {
+                        tracing::warn!(
+                            "dual-initiator race with {} — they win (higher device_id), \
+                             replacing our session",
+                            sender_uuid
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "decrypt failed with existing session for {} but PreKey data present \
+                         -- replacing session (race condition recovery)",
+                        sender_uuid
+                    );
+                }
+            } else {
+                existing_session_handled = true;
+                tracing::error!("decrypt failed for msg {} from {}: {}", qm.id, sender_uuid, e);
+                app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: decrypt failed: {}", qm.id, e)).ok();
+            }
+        }
+        }
+    }
+
+    if !existing_session_handled {
+    tracing::info!("▶ MSG #{} — existing session NOT handled, prekey_data present={}", qm.id, prekey_data.is_some());
+    if let Some((sender_ik, sender_dh_key, sender_dh_sig, ephemeral_pub, pq_ct, otpk_id)) = prekey_data {
+        tracing::info!("▶ MSG #{} — creating RESPONDER session via X4DH (otpk_id={:?})", qm.id, otpk_id);
         let mut eph = [0u8; 32];
         eph.copy_from_slice(&ephemeral_pub);
         let mut sdk = [0u8; 32];
         sdk.copy_from_slice(&sender_dh_key);
+
+        // C4: Reconstruct Alice's Ed25519 identity for DH key binding verification
+        let sender_ed_key = if sender_ik.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&sender_ik);
+            Some(echo_crypto::IdentityPublicKey(arr))
+        } else {
+            None
+        };
+        let sender_dh_sig_ref = if sender_dh_sig.is_empty() { None } else { Some(sender_dh_sig.as_slice()) };
 
         let otp_keypair = otpk_id.and_then(|id| {
             keys.one_time_prekeys.iter().find(|(kid, _)| *kid == id).map(|(_, kp)| kp)
@@ -380,11 +493,19 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             otp_keypair,
             &keys.pq_sk,
             &echo_crypto::PublicKey(sdk),
+            sender_ed_key.as_ref(),
+            sender_dh_sig_ref,
             &echo_crypto::PublicKey(eph),
             &echo_crypto::PqCiphertext(pq_ct.clone()),
         ) {
-            Ok(r) => r,
-            Err(_) => return,
+            Ok(r) => {
+                tracing::info!("▶ MSG #{} — X4DH respond OK", qm.id);
+                r
+            },
+            Err(e) => {
+                tracing::error!("▶ MSG #{} — FAIL X4DH respond: {:?}", qm.id, e);
+                return;
+            }
         };
 
         let mut sik = [0u8; 32];
@@ -430,20 +551,27 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             ephemeral_public: ephemeral_pub,
             pq_ciphertext: pq_ct,
             used_one_time_prekey_id: None,
-            needs_prekey_message: true,
+            needs_prekey_message: false, // Responder: session established via recv, never send PreKey
         };
 
         let mut session = echo_crypto::ratchet::TripleRatchetSession::new(ratchet_state);
-        if let Ok(decrypted) = session.decrypt(&enc_msg) {
-            {
+        tracing::info!("▶ MSG #{} — attempting decrypt with NEW responder session (skip_save={})...", qm.id, skip_session_save);
+        match session.decrypt(&enc_msg) {
+            Ok(decrypted) => {
+            tracing::info!("▶ MSG #{} — ✓ DECRYPT OK with responder session (plaintext len={})", qm.id, decrypted.plaintext.len());
+            if !skip_session_save {
                 let vault = state.vault.lock().unwrap();
                 if vault.save_session(sender_uuid, session.export_state(), &meta).is_err() {
                     tracing::warn!("failed to persist new session for {}, skipping ack", sender_uuid);
                     return;
                 }
+            } else {
+                tracing::info!("dual-initiator winner: decrypted message from {} without saving responder session", sender_uuid);
             }
             ack_single(app, qm.id).await;
-            app.emit(events::EVENT_SESSION_ESTABLISHED, &sender_uuid.to_string()).ok();
+            if !skip_session_save {
+                app.emit(events::EVENT_SESSION_ESTABLISHED, &sender_uuid.to_string()).ok();
+            }
 
             // Check if this is a sender key distribution (group key setup)
             if let Some(skd) = echo_client::wire::decode_skd(&decrypted.plaintext) {
@@ -499,7 +627,15 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
 
             // Send delivery receipt via WS
             send_delivery_receipt(app, sender_uuid, now);
+            }
+            Err(e) => {
+                tracing::error!("▶ MSG #{} — ✗ DECRYPT FAILED with responder session: {}", qm.id, e);
+                app.emit(events::EVENT_MESSAGE_ERROR, &format!("message {}: new session decrypt failed: {}", qm.id, e)).ok();
+            }
         }
+    } else {
+        tracing::error!("▶ MSG #{} — NO PREKEY DATA and no existing session — cannot process (Normal msg with no session!)", qm.id);
+    }
     }
 }
 
@@ -526,7 +662,18 @@ fn decode_media_payload(
 
         // Build data URL for immediate display
         let b64 = base64::engine::general_purpose::STANDARD.encode(&media.data);
-        let data_url = format!("data:{};base64,{}", media.mime_type, b64);
+        const ALLOWED_MIME_TYPES: &[&str] = &[
+            "image/png", "image/jpeg", "image/gif", "image/webp",
+            "audio/mpeg", "audio/ogg", "audio/wav",
+            "video/mp4", "video/webm",
+            "application/pdf",
+        ];
+        let safe_mime = if ALLOWED_MIME_TYPES.contains(&media.mime_type.as_str()) {
+            media.mime_type.clone()
+        } else {
+            "application/octet-stream".to_string()
+        };
+        let data_url = format!("data:{};base64,{}", safe_mime, b64);
 
         (
             history_text,

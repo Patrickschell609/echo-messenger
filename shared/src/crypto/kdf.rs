@@ -81,7 +81,15 @@ pub fn derive_header_key(root_key: &RootKey, sending: bool) -> HeaderKey {
 }
 
 /// Derive session key from X4DH output (initial session establishment).
-pub fn kdf_session(shared_secrets: &[&[u8]]) -> (RootKey, ChainKey) {
+/// M8: Identity keys are included in the HKDF info to bind the session
+/// to the specific communicating parties, preventing key substitution attacks.
+/// `initiator_identity` and `responder_identity` are the Ed25519 public keys
+/// of Alice (initiator) and Bob (responder) respectively.
+pub fn kdf_session(
+    shared_secrets: &[&[u8]],
+    initiator_identity: &[u8],
+    responder_identity: &[u8],
+) -> (RootKey, ChainKey) {
     // Concatenate all DH outputs from X4DH
     let total_len: usize = shared_secrets.iter().map(|s| s.len()).sum();
     let mut combined = Vec::with_capacity(total_len);
@@ -89,8 +97,14 @@ pub fn kdf_session(shared_secrets: &[&[u8]]) -> (RootKey, ChainKey) {
         combined.extend_from_slice(secret);
     }
 
+    // M8: Build info string with identity binding
+    let mut info = Vec::with_capacity(SESSION_INFO.len() + initiator_identity.len() + responder_identity.len());
+    info.extend_from_slice(SESSION_INFO);
+    info.extend_from_slice(initiator_identity);
+    info.extend_from_slice(responder_identity);
+
     let salt = [0u8; 32]; // X3DH spec uses zero salt
-    let derived = hkdf_derive(&salt, &combined, SESSION_INFO, 64);
+    let derived = hkdf_derive(&salt, &combined, &info, 64);
     combined.zeroize();
 
     let mut root = [0u8; 32];

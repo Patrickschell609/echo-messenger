@@ -5,6 +5,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zeroize::Zeroize;
+
 use crate::crypto::aead;
 use crate::crypto::kdf;
 use crate::crypto::pq_kem;
@@ -122,31 +124,13 @@ impl TripleRatchetSession {
             )));
         }
 
-        // Check for epoch ratchet (Layer 3)
-        if let (Some(ref ct), Some(ref new_pk)) =
-            (&header.epoch_ciphertext, &header.new_epoch_public)
-        {
-            self.epoch_ratchet_receive(ct, new_pk)?;
-        }
-
-        // Check if DH ratchet needed (Layer 2)
-        let need_dh_ratchet = self
-            .state
-            .peer_dh_public
-            .as_ref()
-            .map(|pk| pk != &header.dh_public)
-            .unwrap_or(true);
-
-        if need_dh_ratchet {
-            self.dh_ratchet_receive(&header.dh_public)?;
-        }
-
-        // Try to decrypt with current chain or skipped keys
+        // Serialize header for AAD binding (needed for all decrypt paths)
         let header_bytes = bincode::serialize(header)
             .map_err(|e| EchoError::SerializationError(e.to_string()))?;
 
-        // Try skipped keys first
-        let skip_key = (self.state.dh_ratchet_number, header.message_number);
+        // FIX: Try skipped keys FIRST (before any state changes).
+        // Use header.dh_ratchet_number (sender's chain ID) for lookup.
+        let skip_key = (header.dh_ratchet_number, header.message_number);
         if let Some(mk) = self.state.skipped_keys.remove(&skip_key) {
             let padded = aead::aead_decrypt(&mk.0, &message.ciphertext, &header_bytes)?;
             let plaintext = aead::unpad_message(&padded)?;
@@ -160,9 +144,40 @@ impl TripleRatchetSession {
             return Ok(DecryptedMessage {
                 plaintext,
                 sender_epoch: header.epoch_number,
-                sender_dh_ratchet: self.state.dh_ratchet_number,
+                sender_dh_ratchet: header.dh_ratchet_number,
                 message_number: header.message_number,
             });
+        }
+
+        // Check for epoch ratchet (Layer 3) with validation
+        if let (Some(ref ct), Some(ref new_pk)) =
+            (&header.epoch_ciphertext, &header.new_epoch_public)
+        {
+            if header.epoch_number != self.state.epoch_number + 1 {
+                return Err(EchoError::InvalidMessage(
+                    format!("unexpected epoch number: got {}, expected {}",
+                            header.epoch_number, self.state.epoch_number + 1)
+                ));
+            }
+            self.epoch_ratchet_receive(ct, new_pk)?;
+        }
+
+        // Check if DH ratchet needed (Layer 2)
+        let need_dh_ratchet = self
+            .state
+            .peer_dh_public
+            .as_ref()
+            .map(|pk| pk != &header.dh_public)
+            .unwrap_or(true);
+
+        if need_dh_ratchet {
+            // FIX: Store remaining skipped keys from OLD chain before destroying it.
+            // header.prev_chain_length tells us how many messages the sender sent
+            // in their previous chain, so we can store keys we haven't received yet.
+            if header.prev_chain_length > self.state.recv_message_number {
+                self.skip_message_keys(header.prev_chain_length)?;
+            }
+            self.dh_ratchet_receive(&header.dh_public)?;
         }
 
         // Skip ahead if needed
@@ -192,7 +207,7 @@ impl TripleRatchetSession {
         Ok(DecryptedMessage {
             plaintext,
             sender_epoch: header.epoch_number,
-            sender_dh_ratchet: self.state.dh_ratchet_number,
+            sender_dh_ratchet: header.dh_ratchet_number,
             message_number: header.message_number,
         })
     }
@@ -205,10 +220,11 @@ impl TripleRatchetSession {
 
         // Generate new DH key pair
         let new_dh = X25519KeyPair::generate();
-        let dh_output = new_dh.dh(peer_dh)?;
+        let mut dh_output = new_dh.dh(peer_dh)?;
 
         // Derive sending chain from root key + DH output
         let (new_root, new_send_chain) = kdf::kdf_root(&self.state.root_key, &dh_output);
+        dh_output.zeroize(); // M2: zeroize DH shared secret
         self.state.root_key = new_root;
         self.state.sending_chain_key = Some(new_send_chain);
 
@@ -242,19 +258,21 @@ impl TripleRatchetSession {
                 .ok_or(EchoError::ChainExhausted)?
                 .0,
         );
-        let dh_output = our_dh.dh(new_peer_dh)?;
+        let mut dh_output = our_dh.dh(new_peer_dh)?;
 
         // Derive new receiving chain
         let (new_root, new_recv_chain) = kdf::kdf_root(&self.state.root_key, &dh_output);
+        dh_output.zeroize(); // M2: zeroize DH shared secret
         self.state.root_key = new_root;
         self.state.receiving_chain_key = Some(new_recv_chain);
 
         // Generate new DH key pair for sending
         let new_dh = X25519KeyPair::generate();
-        let dh_output2 = new_dh.dh(new_peer_dh)?;
+        let mut dh_output2 = new_dh.dh(new_peer_dh)?;
 
         // Derive new sending chain
         let (new_root2, new_send_chain) = kdf::kdf_root(&self.state.root_key, &dh_output2);
+        dh_output2.zeroize(); // M2: zeroize DH shared secret
         self.state.root_key = new_root2;
         self.state.sending_chain_key = Some(new_send_chain);
 
@@ -282,10 +300,16 @@ impl TripleRatchetSession {
             .ok_or(EchoError::PqKemError("no peer PQ key".into()))?;
 
         // Encapsulate to peer's PQ public key
-        let (ct, ss) = pq_kem::pq_encapsulate(peer_pk)?;
+        let (ct, mut ss) = pq_kem::pq_encapsulate(peer_pk)?;
 
         // Update root key with PQ shared secret
         self.state.root_key = kdf::kdf_epoch(&self.state.root_key, &ss);
+        ss.zeroize(); // M4: zeroize PQ shared secret
+
+        // M1: Force DH ratchet to propagate PQ protection to chain keys immediately
+        if let Some(peer_dh) = self.state.peer_dh_public.clone() {
+            self.dh_ratchet_send(&peer_dh)?;
+        }
 
         // Generate new PQ key pair
         let (new_pk, new_sk) = pq_kem::pq_keygen();
@@ -311,10 +335,11 @@ impl TripleRatchetSession {
             .ok_or(EchoError::PqKemError("no local PQ secret key".into()))?;
 
         // Decapsulate
-        let ss = pq_kem::pq_decapsulate(ct, our_sk)?;
+        let mut ss = pq_kem::pq_decapsulate(ct, our_sk)?;
 
         // Update root key
         self.state.root_key = kdf::kdf_epoch(&self.state.root_key, &ss);
+        ss.zeroize(); // M4: zeroize PQ shared secret
 
         // Update peer's PQ public key
         self.state.peer_epoch_pk = Some(new_peer_pk.clone());

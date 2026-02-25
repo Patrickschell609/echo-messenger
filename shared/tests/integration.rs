@@ -25,6 +25,12 @@ use echo_crypto::ratchet::x4dh::X4DH;
 use echo_crypto::sealed_sender::{self, SenderCertificate};
 use echo_crypto::types::*;
 
+/// Test server key for signing sender certificates in tests.
+fn test_server_key() -> Ed25519KeyPair {
+    // Deterministic test key (seed = 42 repeated)
+    Ed25519KeyPair::from_private_bytes([42u8; 32])
+}
+
 /// Helper: generate a full prekey bundle for a user.
 struct UserKeys {
     identity_ed: Ed25519KeyPair,
@@ -69,9 +75,16 @@ impl UserKeys {
         let spk_sig = self.identity_ed.sign(&self.signed_prekey.public_key().0);
         let pq_sig = self.identity_ed.sign(&self.pq_pk.0);
 
+        // C3: Sign identity_dh_key with Ed25519 to bind it
+        let mut dh_bind_msg = Vec::new();
+        dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
+        dh_bind_msg.extend_from_slice(&self.identity_dh.public_key().0);
+        let dh_key_sig = self.identity_ed.sign(&dh_bind_msg);
+
         PrekeyBundle {
             identity_key: self.identity_ed.public_key(),
             identity_dh_key: self.identity_dh.public_key(),
+            identity_dh_key_signature: dh_key_sig,
             signed_prekey: self.signed_prekey.public_key(),
             signed_prekey_signature: spk_sig,
             signed_prekey_id: self.signed_prekey_id,
@@ -84,17 +97,30 @@ impl UserKeys {
     }
 
     fn sender_cert(&self) -> SenderCertificate {
+        let server_key = test_server_key();
         let expiry = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 86400;
-        SenderCertificate {
+
+        // Sign with test server key (same as real server flow)
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&self.device_id.0);
+        msg.extend_from_slice(&self.identity_ed.public_key().0);
+        msg.extend_from_slice(&expiry.to_le_bytes());
+        let server_sig = server_key.sign(&msg);
+
+        let mut cert = SenderCertificate {
             sender_identity: self.identity_ed.public_key(),
             sender_device_id: self.device_id.clone(),
             expiry,
-            server_signature: vec![0u8; 64], // placeholder for POC
-        }
+            server_signature: server_sig,
+            sender_signature: vec![],
+        };
+        // Counter-sign with sender's Ed25519 key (C1)
+        sealed_sender::countersign_sender_cert(&mut cert, &self.identity_ed.private_key_bytes().0);
+        cert
     }
 }
 
@@ -125,16 +151,17 @@ fn alice_initial_state(
         my_dh_public: dh.public_key(),
         my_dh_private: Some(dh.private_key_bytes()),
         peer_dh_public: Some(bob.signed_prekey.public_key()),
-        root_key,
+        root_key: root_key.clone(),
         sending_chain_key: Some(chain_key),
         receiving_chain_key: None,
         send_message_number: 0,
         recv_message_number: 0,
         prev_sending_chain_length: 0,
-        sending_header_key: None,
-        receiving_header_key: None,
-        next_sending_header_key: None,
-        next_receiving_header_key: None,
+        // M11: Derive initial header keys (initiator direction)
+        sending_header_key: Some(kdf::derive_header_key(&root_key, true)),
+        receiving_header_key: Some(kdf::derive_header_key(&root_key, false)),
+        next_sending_header_key: Some(kdf::derive_header_key(&root_key, true)),
+        next_receiving_header_key: Some(kdf::derive_header_key(&root_key, false)),
         skipped_keys: HashMap::new(),
         processed_ids: HashSet::new(),
         processed_order: VecDeque::new(),
@@ -168,16 +195,17 @@ fn bob_initial_state(
         my_dh_public: bob.signed_prekey.public_key(),
         my_dh_private: Some(bob.signed_prekey.private_key_bytes()),
         peer_dh_public: Some(alice_dh_public.clone()),
-        root_key,
+        root_key: root_key.clone(),
         sending_chain_key: None,
         receiving_chain_key: Some(chain_key),
         send_message_number: 0,
         recv_message_number: 0,
         prev_sending_chain_length: 0,
-        sending_header_key: None,
-        receiving_header_key: None,
-        next_sending_header_key: None,
-        next_receiving_header_key: None,
+        // M11: Derive initial header keys (responder swaps send/recv direction)
+        sending_header_key: Some(kdf::derive_header_key(&root_key, false)),
+        receiving_header_key: Some(kdf::derive_header_key(&root_key, true)),
+        next_sending_header_key: Some(kdf::derive_header_key(&root_key, false)),
+        next_receiving_header_key: Some(kdf::derive_header_key(&root_key, true)),
         skipped_keys: HashMap::new(),
         processed_ids: HashSet::new(),
         processed_order: VecDeque::new(),
@@ -205,6 +233,8 @@ fn test_x4dh_session_establishment() {
         Some(&bob.one_time_prekey),
         &bob.pq_sk,
         &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -234,6 +264,8 @@ fn test_x4dh_without_one_time_prekey() {
         None, // no one-time prekey
         &bob.pq_sk,
         &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -271,6 +303,8 @@ fn test_triple_ratchet_single_message() {
         Some(&bob.one_time_prekey),
         &bob.pq_sk,
         &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -306,6 +340,8 @@ fn test_triple_ratchet_multiple_messages_one_direction() {
         Some(&bob.one_time_prekey),
         &bob.pq_sk,
         &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -341,6 +377,8 @@ fn test_triple_ratchet_bidirectional() {
         Some(&bob.one_time_prekey),
         &bob.pq_sk,
         &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -395,7 +433,7 @@ fn test_sealed_sender_roundtrip() {
 
     // Bob unseals
     let (recovered_cert, recovered_payload) =
-        sealed_sender::unseal_message(&bob.identity_dh, &envelope, None).unwrap();
+        sealed_sender::unseal_message(&bob.identity_dh, &envelope, &test_server_key().public_key().0).unwrap();
 
     assert_eq!(recovered_cert.sender_identity, alice.identity_ed.public_key());
     assert_eq!(recovered_cert.sender_device_id, alice.device_id);
@@ -417,7 +455,7 @@ fn test_sealed_sender_wrong_recipient_fails() {
     .unwrap();
 
     // Eve tries to unseal - must fail
-    let result = sealed_sender::unseal_message(&eve.identity_dh, &envelope, None);
+    let result = sealed_sender::unseal_message(&eve.identity_dh, &envelope, &test_server_key().public_key().0);
     assert!(result.is_err(), "wrong recipient must not unseal");
 }
 
@@ -438,6 +476,8 @@ fn test_full_flow_x4dh_ratchet_sealed_sender() {
         Some(&bob.one_time_prekey),
         &bob.pq_sk,
         &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -481,7 +521,7 @@ fn test_full_flow_x4dh_ratchet_sealed_sender() {
     // The server has ZERO knowledge of sender identity.
 
     // ── Step 5: Bob unseals the envelope ──
-    let (sender_cert, inner) = sealed_sender::unseal_message(&bob.identity_dh, &envelope, None).unwrap();
+    let (sender_cert, inner) = sealed_sender::unseal_message(&bob.identity_dh, &envelope, &test_server_key().public_key().0).unwrap();
 
     // Bob now knows who sent it
     assert_eq!(sender_cert.sender_identity, alice.identity_ed.public_key());
@@ -533,6 +573,8 @@ fn test_replay_protection() {
         Some(&bob.one_time_prekey),
         &bob.pq_sk,
         &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )

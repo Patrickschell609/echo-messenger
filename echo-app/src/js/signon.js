@@ -131,7 +131,7 @@ const SignOn = {
 
     try {
       const result = await this.withTimeout(
-        API.signOn(this.getServer(), passphrase), 15000
+        API.signOn(this.getServer(), passphrase), 60000
       );
       App.deviceId = result.device_id;
       App.navigate('buddylist');
@@ -162,7 +162,7 @@ const SignOn = {
 
     try {
       const result = await this.withTimeout(
-        API.createAccount(this.getServer(), passphrase, inviteCode), 15000
+        API.createAccount(this.getServer(), passphrase, inviteCode), 60000
       );
       App.deviceId = result.device_id;
       App.navigate('buddylist');

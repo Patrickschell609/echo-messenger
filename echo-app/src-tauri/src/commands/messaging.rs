@@ -85,15 +85,32 @@ pub async fn send_message(
             .map_err(|e| format!("No session: {}", e))?
     };
 
+    tracing::info!(
+        "◀ SEND to {} — needs_prekey={}, send_chain={}, recv_chain={}, dh_num={}, send_n={}, recv_n={}",
+        recipient_device,
+        session_meta_loaded.needs_prekey_message,
+        ratchet_state_loaded.sending_chain_key.is_some(),
+        ratchet_state_loaded.receiving_chain_key.is_some(),
+        ratchet_state_loaded.dh_ratchet_number,
+        ratchet_state_loaded.send_message_number,
+        ratchet_state_loaded.recv_message_number,
+    );
+
     // Encrypt (sync, no lock needed)
     let mut session = echo_crypto::ratchet::TripleRatchetSession::new(ratchet_state_loaded);
-    let encrypted = session.encrypt(message.as_bytes()).map_err(|e| e.to_string())?;
+    let encrypted = session.encrypt(message.as_bytes()).map_err(|e| {
+        tracing::error!("◀ SEND ENCRYPT FAILED to {}: {}", recipient_device, e);
+        e.to_string()
+    })?;
 
     let header_bytes = bincode::serialize(&encrypted.header).map_err(|e| e.to_string())?;
+    let wire_type = if session_meta_loaded.needs_prekey_message { "PreKey" } else { "Normal" };
+    tracing::info!("◀ SEND to {} — encrypt OK, wire type={}, msg_len={}", recipient_device, wire_type, message.len());
     let wire_msg = if session_meta_loaded.needs_prekey_message {
         WireMessage::PreKey {
             sender_identity_key: identity_state.identity_ed_public.clone(),
             sender_identity_dh_key: identity_state.identity_dh_public.clone(),
+            sender_identity_dh_signature: identity::sign_identity_dh_binding(&identity_state),
             ephemeral_public: session_meta_loaded.ephemeral_public.clone(),
             pq_ciphertext: session_meta_loaded.pq_ciphertext.clone(),
             used_one_time_prekey_id: session_meta_loaded.used_one_time_prekey_id,
@@ -147,9 +164,12 @@ pub async fn send_message(
 
     // Try to send — on failure, queue to outbox instead of returning error
     let status = match http.send_message(recipient_device, &envelope_bytes).await {
-        Ok(()) => 0u8, // sent
+        Ok(()) => {
+            tracing::info!("◀ SEND to {} — delivered to server OK", recipient_device);
+            0u8 // sent
+        }
         Err(e) => {
-            tracing::warn!("send failed, queuing to outbox: {}", e);
+            tracing::warn!("◀ SEND to {} — server rejected, queuing to outbox: {}", recipient_device, e);
             let outbox = state.outbox.lock().unwrap();
             if let Some(ref ob) = *outbox {
                 ob.queue_message(&device_id, &msg_id, &envelope_bytes)
@@ -375,6 +395,7 @@ pub async fn send_file(
         WireMessage::PreKey {
             sender_identity_key: identity_state.identity_ed_public.clone(),
             sender_identity_dh_key: identity_state.identity_dh_public.clone(),
+            sender_identity_dh_signature: identity::sign_identity_dh_binding(&identity_state),
             ephemeral_public: session_meta_loaded.ephemeral_public.clone(),
             pq_ciphertext: session_meta_loaded.pq_ciphertext.clone(),
             used_one_time_prekey_id: session_meta_loaded.used_one_time_prekey_id,
@@ -540,6 +561,7 @@ async fn send_encrypted_payload(
         WireMessage::PreKey {
             sender_identity_key: identity_state.identity_ed_public.clone(),
             sender_identity_dh_key: identity_state.identity_dh_public.clone(),
+            sender_identity_dh_signature: identity::sign_identity_dh_binding(&identity_state),
             ephemeral_public: session_meta_loaded.ephemeral_public.clone(),
             pq_ciphertext: session_meta_loaded.pq_ciphertext.clone(),
             used_one_time_prekey_id: session_meta_loaded.used_one_time_prekey_id,

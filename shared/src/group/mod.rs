@@ -27,6 +27,8 @@ pub struct SenderKeyState {
     pub chain_key: ChainKey,
     pub iteration: u32,
     pub pq_epoch: u32,
+    #[serde(default)]
+    pub skipped_keys: HashMap<u32, MessageKey>,
 }
 
 impl SenderKeyState {
@@ -38,6 +40,7 @@ impl SenderKeyState {
             chain_key: ChainKey(key),
             iteration: 0,
             pq_epoch: 0,
+            skipped_keys: HashMap::new(),
         }
     }
 
@@ -70,6 +73,8 @@ pub struct GroupSession {
     pub epoch: u32,
     pub our_epoch_pk: Option<PqPublicKey>,
     pub our_epoch_sk: Option<PqSecretKey>,
+    #[serde(default)]
+    pub processed_ids: std::collections::HashSet<Vec<u8>>,
 }
 
 impl GroupSession {
@@ -83,6 +88,7 @@ impl GroupSession {
             epoch: 0,
             our_epoch_pk: None,
             our_epoch_sk: None,
+            processed_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -105,6 +111,7 @@ impl GroupSession {
                 chain_key: dist.chain_key.clone(),
                 iteration: dist.iteration,
                 pq_epoch: 0,
+                skipped_keys: HashMap::new(),
             },
         );
     }
@@ -127,6 +134,20 @@ impl GroupSession {
 
     /// Decrypt a group message.
     pub fn decrypt(&mut self, message: &GroupMessage) -> Result<Vec<u8>> {
+        // Replay protection: hash (sender, iteration, ciphertext) as unique ID
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&message.sender_device.0);
+        hasher.update(&message.iteration.to_le_bytes());
+        hasher.update(&message.ciphertext);
+        let msg_id = hasher.finalize().to_vec();
+
+        if self.processed_ids.contains(&msg_id) {
+            return Err(EchoError::ReplayDetected(
+                "duplicate group message".into()
+            ));
+        }
+
         let sender_state = self
             .member_keys
             .get_mut(&message.sender_device)
@@ -135,14 +156,34 @@ impl GroupSession {
                 message.sender_device
             )))?;
 
-        // Skip ahead if needed
+        // Check skipped keys for out-of-order messages
+        if message.iteration < sender_state.iteration {
+            if let Some(mk) = sender_state.skipped_keys.remove(&message.iteration) {
+                let padded = aead::aead_decrypt(&mk.0, &message.ciphertext, &message.group_id)?;
+                let plaintext = aead::unpad_message(&padded)?;
+                self.processed_ids.insert(msg_id);
+                return Ok(plaintext);
+            } else {
+                return Err(EchoError::InvalidMessage(
+                    format!("no skipped key for iteration {}", message.iteration)
+                ));
+            }
+        }
+
+        // Store skipped keys instead of discarding them
         while sender_state.iteration < message.iteration {
-            let _ = sender_state.ratchet(); // Skip keys (could store for out-of-order)
+            let skipped_key = sender_state.ratchet();
+            let skipped_iteration = sender_state.iteration - 1;
+            sender_state.skipped_keys.insert(skipped_iteration, skipped_key);
         }
 
         let message_key = sender_state.ratchet();
         let padded = aead::aead_decrypt(&message_key.0, &message.ciphertext, &message.group_id)?;
-        aead::unpad_message(&padded)
+        let plaintext = aead::unpad_message(&padded)?;
+
+        self.processed_ids.insert(msg_id);
+
+        Ok(plaintext)
     }
 }
 
