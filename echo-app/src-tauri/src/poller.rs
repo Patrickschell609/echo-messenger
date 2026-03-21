@@ -92,6 +92,11 @@ pub fn start_poller(app: AppHandle) {
                                 }
                             }
                             _ = prekey_timer.tick() => {
+                                // Safety net: poll HTTP even in WS mode to catch missed messages
+                                // (e.g. network switch, dead WS connection server hasn't detected)
+                                if let Err(e) = poll_messages(&app).await {
+                                    tracing::debug!("ws-mode safety poll failed: {}", e);
+                                }
                                 // Periodic prekey check, key rotation, outbox drain, group poll, and purge in WS mode
                                 check_and_replenish_prekeys(&app).await;
                                 check_and_rotate_keys(&app).await;
@@ -217,7 +222,7 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
     };
 
     // Load server transparency key for mandatory cert verification
-    let server_pk: Option<[u8; 32]> = {
+    let mut server_pk: Option<[u8; 32]> = {
         let vault = state.vault.lock().unwrap();
         vault.load_server_transparency_key().and_then(|hex_str| {
             let bytes = hex::decode(&hex_str).ok()?;
@@ -230,6 +235,33 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             }
         })
     };
+
+    // If transparency key is missing, fetch it from server before rejecting
+    if server_pk.is_none() {
+        tracing::info!("▶ MSG #{} — no cached transparency key, fetching from server...", qm.id);
+        let http = {
+            let h = state.http.lock().unwrap();
+            h.as_ref().map(|http| {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+            })
+        };
+        if let Some(http) = http {
+            if let Ok(sth_resp) = http.fetch_sth().await {
+                if let Ok(bytes) = hex::decode(&sth_resp.server_public_key) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        server_pk = Some(arr);
+                        let vault = state.vault.lock().unwrap();
+                        vault.save_server_transparency_key(&sth_resp.server_public_key).ok();
+                        tracing::info!("▶ MSG #{} — fetched and cached transparency key", qm.id);
+                    }
+                }
+            }
+        }
+    }
 
     // H1: server transparency key is now REQUIRED for cert verification
     let server_pk = match server_pk {
@@ -688,7 +720,7 @@ fn decode_media_payload(
     }
 }
 
-/// Send a delivery receipt to the sender via WS (graceful no-op if polling).
+/// Send a delivery receipt to the sender via WS, falling back to HTTP.
 fn send_delivery_receipt(app: &AppHandle, sender: uuid::Uuid, timestamp: u64) {
     let state = app.state::<AppState>();
     let ws_tx = {
@@ -696,11 +728,40 @@ fn send_delivery_receipt(app: &AppHandle, sender: uuid::Uuid, timestamp: u64) {
         tx.clone()
     };
     if let Some(tx) = ws_tx {
-        let _ = tx.try_send(WsOutbound::Delivered {
+        // Try WS first
+        if tx.try_send(WsOutbound::Delivered {
             recipient_device_id: sender.to_string(),
             up_to_timestamp: timestamp as i64,
-        });
+        }).is_ok() {
+            return;
+        }
     }
+    // Fallback: send via HTTP
+    let app_handle = app.clone();
+    tokio::spawn(async move {
+        let state = app_handle.state::<AppState>();
+        let http = {
+            let identity = state.identity.lock().unwrap();
+            let id_state = match identity.as_ref() {
+                Some(s) => s.clone(),
+                None => return,
+            };
+            let h = state.http.lock().unwrap();
+            match h.as_ref() {
+                Some(http) => {
+                    let mut ed_bytes = [0u8; 32];
+                    ed_bytes.copy_from_slice(&id_state.identity_ed_private);
+                    echo_client::http::HttpClient::with_auth(
+                        http.base_url(),
+                        id_state.device_id,
+                        &ed_bytes,
+                    )
+                }
+                None => return,
+            }
+        };
+        let _ = http.send_delivery_receipt(sender, timestamp as i64).await;
+    });
 }
 
 /// Ack a single message.
@@ -1082,6 +1143,11 @@ fn process_control_message(
     let state = app.state::<AppState>();
 
     match ctrl {
+        echo_client::wire::ControlMessage::SessionInit => {
+            // Session init: X4DH was already processed from the PreKey wrapper.
+            // Nothing to do here — session is established, green dot will show.
+            tracing::info!("session init control message from {} — session established", sender_uuid_str);
+        }
         echo_client::wire::ControlMessage::SetTimer { duration_secs } => {
             // Validate: reject absurd timer values (max 30 days)
             const MAX_TIMER_SECS: u64 = 30 * 24 * 60 * 60;

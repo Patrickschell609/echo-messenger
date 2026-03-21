@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/messages/send", post(api::messages::send_message))
         .route("/v1/messages/receive", get(api::messages::receive_messages))
         .route("/v1/messages/ack", post(api::messages::ack_message))
+        .route("/v1/messages/delivered", post(api::messages::send_delivery_receipt))
         // Key transparency
         .route("/v1/transparency/sth", get(api::keys::get_sth))
         .route("/v1/transparency/proof/{device_id}", get(api::keys::get_transparency_proof))

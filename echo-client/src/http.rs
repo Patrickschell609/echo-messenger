@@ -238,6 +238,32 @@ impl HttpClient {
         Ok(())
     }
 
+    /// POST /v1/messages/delivered (authenticated) — send delivery receipt via HTTP
+    pub async fn send_delivery_receipt(&self, recipient_device_id: Uuid, up_to_timestamp: i64) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req {
+            recipient_device_id: Uuid,
+            up_to_timestamp: i64,
+        }
+
+        let path = "/v1/messages/delivered";
+        let body = serde_json::to_vec(&Req { recipient_device_id, up_to_timestamp })?;
+        let mut req = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .header("content-type", "application/json")
+            .body(body.clone());
+
+        req = self.add_auth_headers(req, "POST", path, Some(&body));
+
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            // Non-critical — don't propagate error
+            tracing::debug!("delivery receipt failed: {}", resp.status());
+        }
+        Ok(())
+    }
+
     /// POST /v1/register — returns (account_id, auth_nonce)
     pub async fn register(&self, phone_hash_hex: &str) -> Result<(Uuid, String)> {
         #[derive(Serialize)]

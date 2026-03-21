@@ -61,6 +61,8 @@ pub const CTRL_MAGIC: &[u8; 4] = b"\x00CTL";
 /// Control messages sent through the encrypted ratchet.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ControlMessage {
+    /// Session initiation handshake (no visible message, just establishes the session).
+    SessionInit,
     /// Set auto-delete timer for the conversation (0 = off).
     SetTimer { duration_secs: u64 },
     /// Edit a previously sent message.

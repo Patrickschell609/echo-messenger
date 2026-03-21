@@ -307,9 +307,14 @@ const BuddyList = {
 
   async autoEstablish(deviceId) {
     try {
+      const ourDeviceId = await API.getDeviceId();
+      console.log('[ECHO] autoEstablish: our=' + ourDeviceId + ' peer=' + deviceId);
+      // Always try to establish -- the Rust side handles dedup via session_exists check
+      console.log('[ECHO] Initiating session on buddy add');
       await API.establishSession(deviceId);
       await this.refresh();
     } catch (e) {
+      console.error('[ECHO] autoEstablish failed:', e);
       // Session will establish later via polling — not an error
     }
   },

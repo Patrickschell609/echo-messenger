@@ -257,6 +257,41 @@ pub async fn receive_messages(
     Ok(Json(ReceiveMessagesResponse { messages }))
 }
 
+/// POST /v1/messages/delivered
+/// Notify a peer that their messages have been delivered (HTTP fallback for WS receipts).
+#[derive(Deserialize)]
+pub struct DeliveryReceiptRequest {
+    pub recipient_device_id: Uuid,
+    pub up_to_timestamp: i64,
+}
+
+pub async fn send_delivery_receipt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DeliveryReceiptRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let device_id = authenticate_device(
+        &headers,
+        "POST",
+        "/v1/messages/delivered",
+        &state.db,
+        &state.redis,
+    ).await?;
+
+    // Forward via WS if recipient is connected
+    let conns = state.ws_connections.read().await;
+    if let Some(tx) = conns.get(&req.recipient_device_id) {
+        let _ = tx.try_send(super::WsOutbound::Delivered {
+            sender_device_id: device_id,
+            up_to_timestamp: req.up_to_timestamp,
+        });
+    }
+    // If not connected, receipt is lost — acceptable since they'll see it on next poll.
+    // Future: store receipts in DB for offline delivery.
+
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
 /// POST /v1/messages/ack
 /// Acknowledge receipt of messages, removing them from the queue.
 #[derive(Deserialize)]

@@ -154,21 +154,71 @@ pub async fn establish_session(
         needs_prekey_message: true,
     };
 
-    // Save session to vault
+    tracing::info!(
+        "⚡ SESSION X4DH complete for {} — sending PreKey message immediately",
+        recipient_device,
+    );
+
+    // Encrypt a SessionInit control message as the PreKey payload
+    let init_payload = echo_client::wire::encode_ctrl(&echo_client::wire::ControlMessage::SessionInit);
+    let mut session = echo_crypto::ratchet::TripleRatchetSession::new(ratchet_state);
+    let encrypted = session.encrypt(&init_payload).map_err(|e| e.to_string())?;
+
+    let header_bytes = bincode::serialize(&encrypted.header).map_err(|e| e.to_string())?;
+    let wire_msg = echo_client::wire::WireMessage::PreKey {
+        sender_identity_key: identity_state.identity_ed_public.clone(),
+        sender_identity_dh_key: identity_state.identity_dh_public.clone(),
+        sender_identity_dh_signature: identity::sign_identity_dh_binding(&identity_state),
+        ephemeral_public: meta.ephemeral_public.clone(),
+        pq_ciphertext: meta.pq_ciphertext.clone(),
+        used_one_time_prekey_id: meta.used_one_time_prekey_id,
+        ratchet_header: header_bytes,
+        encrypted_header: encrypted.encrypted_header,
+        ciphertext: encrypted.ciphertext,
+    };
+
+    let wire_payload = bincode::serialize(&wire_msg).map_err(|e| e.to_string())?;
+
+    // Seal with sender cert
+    let cert: echo_crypto::sealed_sender::SenderCertificate = {
+        let vault = state.vault.lock().unwrap();
+        vault.load_sender_cert()
+            .unwrap_or_else(|| identity::build_sender_cert(&identity_state))
+    };
+    let envelope = echo_crypto::sealed_sender::seal_message(
+        &meta.recipient_dh_key,
+        &cert,
+        &wire_payload,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let envelope_bytes = bincode::serialize(&envelope).map_err(|e| e.to_string())?;
+
+    // Persist ratchet state BEFORE network send (AV-06: prevents nonce reuse on retry)
+    let updated_ratchet = session.export_state().clone();
+    let mut updated_meta = meta;
+    updated_meta.needs_prekey_message = false; // PreKey sent
     {
         let vault = state.vault.lock().unwrap();
         vault
-            .save_session(recipient_device, &ratchet_state, &meta)
+            .save_session(recipient_device, &updated_ratchet, &updated_meta)
             .map_err(|e| e.to_string())?;
     }
 
-    tracing::info!(
-        "⚡ SESSION established for {} — initiator, needs_prekey=true, send_chain={}, recv_chain={}, dh_num={}",
-        recipient_device,
-        ratchet_state.sending_chain_key.is_some(),
-        ratchet_state.receiving_chain_key.is_some(),
-        ratchet_state.dh_ratchet_number
-    );
+    // Send the PreKey message to the server
+    match http.send_message(recipient_device, &envelope_bytes).await {
+        Ok(()) => {
+            tracing::info!("⚡ SESSION PreKey message delivered to server for {}", recipient_device);
+        }
+        Err(e) => {
+            tracing::warn!("⚡ SESSION PreKey send failed for {}: {} — queuing to outbox", recipient_device, e);
+            let outbox = state.outbox.lock().unwrap();
+            if let Some(ref ob) = *outbox {
+                let msg_id = format!("{}-prekey-init", recipient_device);
+                ob.queue_message(&device_id, &msg_id, &envelope_bytes).ok();
+            }
+        }
+    }
 
     let result = SessionResult {
         device_id: device_id.clone(),
