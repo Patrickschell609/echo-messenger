@@ -302,7 +302,7 @@ impl HttpClient {
         account_id: Uuid,
         keys: &KeyMaterial,
         auth_nonce: Option<&str>,
-    ) -> Result<(Uuid, Option<Vec<u8>>, Option<String>)> {
+    ) -> Result<(Uuid, Option<Vec<u8>>, Option<String>, Option<String>)> {
         #[derive(Serialize)]
         struct OtpkReq {
             key_id: i32,
@@ -330,6 +330,8 @@ impl HttpClient {
             device_id: Uuid,
             sender_cert: Option<String>,
             short_code: Option<String>,
+            #[serde(default)]
+            screen_name: Option<String>,
         }
 
         let otpks: Vec<OtpkReq> = keys
@@ -394,7 +396,7 @@ impl HttpClient {
             .map(|h| hex::decode(h))
             .transpose()
             .map_err(|_| anyhow!("invalid sender_cert hex in response"))?;
-        Ok((data.device_id, cert_bytes, data.short_code))
+        Ok((data.device_id, cert_bytes, data.short_code, data.screen_name))
     }
 
     /// GET /v1/keys/:device_id (authenticated)
@@ -527,10 +529,15 @@ impl HttpClient {
         Ok(data)
     }
 
-    /// GET /v1/lookup/{code} (authenticated) — resolve a short code to a device
+    /// GET /v1/lookup/{query} (authenticated) — resolve a short code or screen name to a device
     pub async fn lookup_by_code(&self, code: &str) -> Result<LookupResponse> {
-        let normalized = code.replace('-', "").to_uppercase();
-        let path = format!("/v1/lookup/{}", normalized);
+        // If it looks like a short code, normalize it; otherwise pass as-is (screen name)
+        let query = if Self::is_short_code(code) {
+            code.replace('-', "").to_uppercase()
+        } else {
+            code.to_string()
+        };
+        let path = format!("/v1/lookup/{}", query);
         let mut req = self.client.get(format!("{}{}", self.base_url, path));
         req = self.add_auth_headers(req, "GET", &path, None);
 
@@ -538,10 +545,65 @@ impl HttpClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("lookup_by_code failed ({}): {}", status, body));
+            return Err(anyhow!("lookup failed ({}): {}", status, body));
         }
 
         let data: LookupResponse = resp.json().await?;
+        Ok(data)
+    }
+
+    /// Check if a string looks like a short code (8 chars from unambiguous alphabet).
+    fn is_short_code(s: &str) -> bool {
+        let normalized = s.replace('-', "").to_uppercase();
+        normalized.len() == 8
+            && normalized
+                .chars()
+                .all(|c| "ABCDEFGHJKMNPQRSTUVWXYZ23456789".contains(c))
+    }
+
+    /// GET /v1/screen-name/check/{name} (unauthenticated) — check screen name availability
+    pub async fn check_screen_name(&self, name: &str) -> Result<CheckScreenNameResponse> {
+        let path = format!("/v1/screen-name/check/{}", name);
+        let mut req = self.client.get(format!("{}{}", self.base_url, path));
+        // Add auth headers if available (post-signup calls), but not required
+        if self.auth.is_some() {
+            req = self.add_auth_headers(req, "GET", &path, None);
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("check_screen_name failed ({}): {}", status, body));
+        }
+
+        let data: CheckScreenNameResponse = resp.json().await?;
+        Ok(data)
+    }
+
+    /// POST /v1/screen-name/set (authenticated) — claim or change screen name
+    pub async fn set_screen_name(&self, name: &str) -> Result<SetScreenNameResponse> {
+        #[derive(Serialize)]
+        struct Req { screen_name: String }
+
+        let path = "/v1/screen-name/set";
+        let body = serde_json::to_vec(&Req { screen_name: name.to_string() })?;
+        let mut req = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .header("content-type", "application/json")
+            .body(body.clone());
+
+        req = self.add_auth_headers(req, "POST", path, Some(&body));
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("set_screen_name failed ({}): {}", status, body));
+        }
+
+        let data: SetScreenNameResponse = resp.json().await?;
         Ok(data)
     }
 
@@ -726,14 +788,33 @@ pub struct ProfileResponse {
     pub device_id: String,
     pub display_name: Option<String>,
     pub bio: Option<String>,
+    #[serde(default)]
+    pub screen_name: Option<String>,
 }
 
-/// Response from /v1/lookup/{code}.
+/// Response from /v1/lookup/{code} (also accepts screen names).
 #[derive(Deserialize, Clone, Serialize)]
 pub struct LookupResponse {
     pub device_id: String,
     pub display_name: Option<String>,
     pub short_code: String,
+    #[serde(default)]
+    pub screen_name: Option<String>,
+}
+
+/// Response from /v1/screen-name/check/{name}.
+#[derive(Deserialize, Clone, Serialize)]
+pub struct CheckScreenNameResponse {
+    pub available: bool,
+    pub early_adopter: bool,
+    pub min_length: u8,
+}
+
+/// Response from /v1/screen-name/set.
+#[derive(Deserialize, Clone, Serialize)]
+pub struct SetScreenNameResponse {
+    pub screen_name: String,
+    pub device_id: String,
 }
 
 /// Response from /v1/transparency/sth

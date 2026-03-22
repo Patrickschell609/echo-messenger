@@ -256,6 +256,27 @@ body {
   opacity: 1;
 }
 
+.screen-name-group {
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  transition: max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.screen-name-group.visible {
+  max-height: 80px;
+  opacity: 1;
+}
+
+.screen-name-status {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  pointer-events: none;
+}
+
 .btn {
   padding: 10px 20px;
   font-family: inherit;

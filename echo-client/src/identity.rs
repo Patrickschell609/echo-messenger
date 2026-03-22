@@ -135,6 +135,9 @@ pub struct IdentityState {
     /// Human-friendly short code (e.g. "A7X2-KM9P")
     #[serde(default)]
     pub short_code: Option<String>,
+    /// User-chosen screen name (e.g. "ghost")
+    #[serde(default)]
+    pub screen_name: Option<String>,
 }
 
 impl Drop for IdentityState {
@@ -307,6 +310,7 @@ impl IdentityStore {
             prev_pq_prekey_id: None,
             prev_key_expiry: None,
             short_code: None,
+            screen_name: None,
         };
 
         self.vault.write_file("identity.enc", &state)?;

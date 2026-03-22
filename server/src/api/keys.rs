@@ -56,6 +56,8 @@ pub struct UploadPrekeysResponse {
     pub sender_cert: Option<String>,
     /// Human-friendly short code (e.g. "A7X2KM9P")
     pub short_code: Option<String>,
+    /// User's chosen screen name (if set)
+    pub screen_name: Option<String>,
 }
 
 pub async fn upload_prekeys(
@@ -219,6 +221,17 @@ pub async fn upload_prekeys(
         }
     };
 
+    // Fetch screen_name if set (returning users get their name back)
+    let screen_name: Option<String> = {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT screen_name FROM devices WHERE id = $1"
+        )
+        .bind(device_id)
+        .fetch_optional(&state.db)
+        .await?;
+        row.and_then(|r| r.0)
+    };
+
     // Limit one-time prekeys
     if req.one_time_prekeys.len() > 200 {
         return Err(ApiError::BadRequest("max 200 prekeys per upload".into()));
@@ -300,6 +313,7 @@ pub async fn upload_prekeys(
         device_id,
         sender_cert: cert_hex,
         short_code,
+        screen_name,
     }))
 }
 

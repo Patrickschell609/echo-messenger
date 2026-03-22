@@ -3,6 +3,8 @@ const SignOn = {
   hasVault: false,
   isNewAccount: false,
   showServer: false,
+  _checkTimer: null,
+  _screenNameAvailable: false,
 
   async render() {
     try {
@@ -30,6 +32,15 @@ const SignOn = {
             <div class="input-group">
               <input type="text" class="input-field" id="inviteCode"
                 placeholder="Invite code">
+            </div>
+          </div>
+
+          <div class="screen-name-group ${this.isNewAccount ? 'visible' : ''}" id="screenNameGroup">
+            <div class="input-group" style="position:relative">
+              <input type="text" class="input-field" id="screenName"
+                placeholder="Pick a screen name" maxlength="20"
+                autocomplete="off" spellcheck="false">
+              <span class="screen-name-status" id="screenNameStatus"></span>
             </div>
           </div>
 
@@ -71,18 +82,82 @@ const SignOn = {
 
     el('btnAction').addEventListener('click', () => this.doAction());
 
+    // Screen name availability check (debounced)
+    const screenNameInput = el('screenName');
+    if (screenNameInput) {
+      screenNameInput.addEventListener('input', () => {
+        this._screenNameAvailable = false;
+        clearTimeout(this._checkTimer);
+        const val = screenNameInput.value.trim();
+        const status = el('screenNameStatus');
+
+        if (!val) {
+          status.textContent = '';
+          return;
+        }
+
+        // Client-side format validation
+        if (!/^[a-zA-Z]/.test(val)) {
+          status.textContent = 'Must start with a letter';
+          status.style.color = '#ff4444';
+          return;
+        }
+        if (/[^a-zA-Z0-9_.]/.test(val)) {
+          status.textContent = 'Letters, numbers, _ and . only';
+          status.style.color = '#ff4444';
+          return;
+        }
+        if (/(\.\.|__|_\.|\.\_)/.test(val)) {
+          status.textContent = 'No consecutive . or _';
+          status.style.color = '#ff4444';
+          return;
+        }
+
+        status.textContent = '...';
+        status.style.color = '#888';
+
+        this._checkTimer = setTimeout(async () => {
+          try {
+            const result = await API.checkScreenName(val, SignOn.getServer());
+            const minLen = result.min_length || 5;
+            if (val.length < minLen) {
+              status.textContent = minLen === 3
+                ? 'Min 3 characters (early adopter)'
+                : 'Min 5 characters';
+              status.style.color = '#ff4444';
+              return;
+            }
+            if (result.available) {
+              status.textContent = result.early_adopter ? 'Available (early adopter)' : 'Available';
+              status.style.color = '#44ff44';
+              this._screenNameAvailable = true;
+            } else {
+              status.textContent = 'Taken';
+              status.style.color = '#ff4444';
+            }
+          } catch (e) {
+            status.textContent = 'Check failed';
+            status.style.color = '#ff4444';
+          }
+        }, 300);
+      });
+    }
+
     el('btnToggleMode').addEventListener('click', () => {
       this.isNewAccount = !this.isNewAccount;
       const inviteGroup = el('inviteGroup');
+      const screenNameGroup = el('screenNameGroup');
       const btn = el('btnAction');
       const toggle = el('btnToggleMode');
 
       if (this.isNewAccount) {
         inviteGroup.classList.add('visible');
+        screenNameGroup.classList.add('visible');
         btn.textContent = 'Create Account';
         toggle.textContent = 'I Have an Account';
       } else {
         inviteGroup.classList.remove('visible');
+        screenNameGroup.classList.remove('visible');
         btn.textContent = 'Sign On';
         toggle.textContent = 'New Account Instead';
       }
@@ -144,6 +219,7 @@ const SignOn = {
   async doCreate() {
     const passphrase = document.getElementById('passphrase').value;
     const inviteCode = document.getElementById('inviteCode')?.value?.trim() || '';
+    const screenName = document.getElementById('screenName')?.value?.trim() || '';
 
     if (!passphrase) {
       App.toastError('Enter a passphrase');
@@ -157,12 +233,20 @@ const SignOn = {
       App.toastError('Enter an invite code');
       return;
     }
+    if (!screenName) {
+      App.toastError('Pick a screen name');
+      return;
+    }
+    if (!this._screenNameAvailable) {
+      App.toastError('Screen name is not available');
+      return;
+    }
 
     this.setLoading(true);
 
     try {
       const result = await this.withTimeout(
-        API.createAccount(this.getServer(), passphrase, inviteCode), 60000
+        API.createAccount(this.getServer(), passphrase, inviteCode, screenName), 60000
       );
       App.deviceId = result.device_id;
       App.navigate('buddylist');

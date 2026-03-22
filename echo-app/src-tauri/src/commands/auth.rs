@@ -15,6 +15,7 @@ pub struct SignOnResult {
     pub device_id: String,
     pub account_id: String,
     pub short_code: Option<String>,
+    pub screen_name: Option<String>,
 }
 
 /// Create a new account on the server via invite code, generate keys, save to vault.
@@ -24,6 +25,7 @@ pub async fn create_account(
     server_url: String,
     passphrase: String,
     invite_code: String,
+    screen_name: String,
 ) -> Result<SignOnResult, String> {
     let state = app.state::<AppState>();
 
@@ -37,9 +39,22 @@ pub async fn create_account(
     // Generate keys
     let keys = KeyMaterial::generate();
 
-    // Upload prekeys with auth nonce + signature — returns device_id + signed sender cert + short code
-    let (device_id, sender_cert_bytes, short_code) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await.map_err(|e| e.to_string())?;
+    // Upload prekeys with auth nonce + signature — returns device_id + signed sender cert + short code + screen name
+    let (device_id, sender_cert_bytes, short_code, _existing_screen_name) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await.map_err(|e| e.to_string())?;
     let short_code_for_result = short_code.clone();
+
+    // Claim screen name (requires authenticated HTTP client)
+    let mut ed_bytes_tmp = [0u8; 32];
+    ed_bytes_tmp.copy_from_slice(&keys.identity_ed.private_key_bytes().0);
+    let auth_http_tmp = HttpClient::with_auth(&server_url, device_id, &ed_bytes_tmp);
+    let screen_name_result = if !screen_name.is_empty() {
+        match auth_http_tmp.set_screen_name(&screen_name).await {
+            Ok(resp) => Some(resp.screen_name),
+            Err(e) => return Err(format!("Screen name error: {}", e)),
+        }
+    } else {
+        None
+    };
 
     // Build identity state directly (no plaintext IdentityStore)
     let identity_state = echo_client::identity::IdentityState {
@@ -67,6 +82,7 @@ pub async fn create_account(
         prev_pq_prekey_id: None,
         prev_key_expiry: None,
         short_code,
+        screen_name: screen_name_result.clone(),
     };
 
     // Initialize encrypted vault
@@ -119,6 +135,7 @@ pub async fn create_account(
         device_id: device_id.to_string(),
         account_id: account_id.to_string(),
         short_code: short_code_for_result,
+        screen_name: screen_name_result,
     };
 
     app.emit(events::EVENT_SIGNED_IN, &result).ok();
@@ -169,6 +186,7 @@ pub async fn sign_on(
     let auth_http = HttpClient::with_auth(&server_url, device_id, &ed_bytes);
 
     let short_code = identity_state.short_code.clone();
+    let screen_name = identity_state.screen_name.clone();
 
     // Update state
     *state.http.lock().unwrap() = Some(auth_http);
@@ -182,6 +200,7 @@ pub async fn sign_on(
         device_id: device_id.to_string(),
         account_id: account_id.to_string(),
         short_code,
+        screen_name,
     };
 
     app.emit(events::EVENT_SIGNED_IN, &result).ok();

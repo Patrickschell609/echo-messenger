@@ -6,8 +6,8 @@ const API = {
     return invoke('vault_exists');
   },
 
-  createAccount(serverUrl, passphrase, inviteCode) {
-    return invoke('create_account', { serverUrl, passphrase, inviteCode });
+  createAccount(serverUrl, passphrase, inviteCode, screenName) {
+    return invoke('create_account', { serverUrl, passphrase, inviteCode, screenName: screenName || '' });
   },
 
   signOn(serverUrl, passphrase) {
@@ -72,6 +72,18 @@ const API = {
 
   fetchProfile(deviceId) {
     return invoke('fetch_profile', { deviceId });
+  },
+
+  checkScreenName(name, serverUrl) {
+    return invoke('check_screen_name', { name, serverUrl: serverUrl || null });
+  },
+
+  setScreenName(name) {
+    return invoke('set_screen_name', { name });
+  },
+
+  getScreenName() {
+    return invoke('get_screen_name');
   },
 
   sendFile(deviceId, fileData, filename, mimeType) {

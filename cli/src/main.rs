@@ -121,7 +121,7 @@ async fn cmd_register(http: &HttpClient, store: &IdentityStore, invite: &str) ->
     let keys = identity::KeyMaterial::generate();
 
     println!("Uploading prekey bundle...");
-    let (device_id, _sender_cert, _short_code) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await?;
+    let (device_id, _sender_cert, _short_code, _screen_name) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await?;
     println!("Device: {}", device_id);
 
     store.save(account_id, device_id, &keys)?;

@@ -18,9 +18,12 @@ const BuddyList = {
 
     this.addFormOpen = false;
 
-    // Load short code if not already cached
+    // Load short code and screen name if not already cached
     if (!this._shortCode) {
       try { this._shortCode = await API.getShortCode(); } catch (_) {}
+    }
+    if (!this._screenName) {
+      try { this._screenName = await API.getScreenName(); } catch (_) {}
     }
 
     const app = document.getElementById('app');
@@ -35,11 +38,11 @@ const BuddyList = {
         </div>
 
         <div class="my-id-section">
-          <span class="my-id-name" id="myDisplayName" title="Click to edit">${esc(this.profileCache[deviceId]?.display_name || shortId)}</span>
+          <span class="my-id-name" id="myDisplayName" title="Click to edit">${esc(this._screenName || this.profileCache[deviceId]?.display_name || shortId)}</span>
           <span class="my-short-code" id="myShortCode">${this._shortCode ? this._formatCode(this._shortCode) : ''}</span>
           <button class="my-id-btn" id="btnEditName">Edit</button>
           <button class="my-id-btn" id="btnQR">QR</button>
-          <button class="my-id-btn" id="btnCopy">${this._shortCode ? 'Copy Code' : 'Copy ID'}</button>
+          <button class="my-id-btn" id="btnCopy">${this._screenName ? 'Copy Name' : (this._shortCode ? 'Copy Code' : 'Copy ID')}</button>
           <button class="my-id-btn" id="btnInvite">Invite</button>
         </div>
 
@@ -49,7 +52,7 @@ const BuddyList = {
 
         <div class="add-buddy-form" id="addBuddyForm">
           <div class="input-row">
-            <input type="text" class="input-field" id="addBuddyId" placeholder="Friend's code (e.g. A7X2-KM9P)">
+            <input type="text" class="input-field" id="addBuddyId" placeholder="Screen name or short code">
             <button class="btn btn-primary" id="btnAddBuddy">Add</button>
           </div>
           <div class="add-buddy-name-row">
@@ -95,7 +98,7 @@ const BuddyList = {
     });
 
     document.getElementById('btnCopy').addEventListener('click', () => {
-      const text = this._shortCode ? this._formatCode(this._shortCode) : App.deviceId;
+      const text = this._screenName || (this._shortCode ? this._formatCode(this._shortCode) : App.deviceId);
       navigator.clipboard.writeText(text).catch(() => {});
       App.toastSuccess('Copied to clipboard');
     });
@@ -156,10 +159,10 @@ const BuddyList = {
         this.fetchProfiles();
       }
 
-      // Use server profile name > local name > truncated UUID
+      // Use screen_name > display_name > local name > truncated UUID
       for (const b of this.buddies) {
         const cached = this.profileCache[b.device_id];
-        const name = (cached && cached.display_name) || b.display_name || b.device_id.substring(0, 8) + '...';
+        const name = (cached && cached.screen_name) || (cached && cached.display_name) || b.display_name || b.device_id.substring(0, 8) + '...';
         App.cacheBuddyName(b.device_id, name);
       }
     } catch (e) {
@@ -208,7 +211,7 @@ const BuddyList = {
     container.innerHTML = this.buddies.map((b, i) => {
       const unread = App.getUnread(b.device_id);
       const cached = this.profileCache[b.device_id];
-      const name = (cached && cached.display_name) || b.display_name || b.device_id.substring(0, 8) + '...';
+      const name = (cached && cached.screen_name) || (cached && cached.display_name) || b.display_name || b.device_id.substring(0, 8) + '...';
       const initial = name.charAt(0).toUpperCase();
       const colorIdx = b.device_id.charCodeAt(0) % 8;
       const avatarColor = avatarColors[colorIdx];
@@ -267,7 +270,7 @@ const BuddyList = {
     const displayName = nameInput?.value?.trim() || '';
 
     if (!value) {
-      App.toastError('Enter a short code or device UUID');
+      App.toastError('Enter a screen name, short code, or device UUID');
       return;
     }
 
@@ -275,16 +278,15 @@ const BuddyList = {
       let deviceId = value;
       let resolvedName = displayName;
 
-      if (this._isShortCode(value)) {
-        // Resolve short code to device ID
+      if (this._isUuid(value)) {
+        // Direct UUID -- use as-is
+      } else {
+        // Could be a short code or screen name -- server detects the type
         const lookup = await API.lookupCode(value);
         deviceId = lookup.device_id;
-        if (!resolvedName && lookup.display_name) {
-          resolvedName = lookup.display_name;
+        if (!resolvedName) {
+          resolvedName = lookup.screen_name || lookup.display_name || '';
         }
-      } else if (!this._isUuid(value)) {
-        App.toastError('Enter a valid short code (e.g. A7X2-KM9P) or UUID');
-        return;
       }
 
       await API.addBuddy(deviceId, resolvedName);

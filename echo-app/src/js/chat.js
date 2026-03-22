@@ -13,7 +13,9 @@ const Chat = {
 
   async open(deviceId, displayName) {
     this.deviceId = deviceId;
-    this.displayName = displayName || deviceId.substring(0, 8) + '...';
+    // Prefer screen_name from profile cache
+    const cached = typeof BuddyList !== 'undefined' ? BuddyList.profileCache[deviceId] : null;
+    this.displayName = (cached && cached.screen_name) || displayName || deviceId.substring(0, 8) + '...';
     this.messages = [];
     this.hasSession = false;
     this.establishing = false;

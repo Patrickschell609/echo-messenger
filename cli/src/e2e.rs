@@ -185,7 +185,7 @@ async fn register_identity(
 ) -> Result<(uuid::Uuid, Option<String>)> {
     let (account_id, auth_nonce) = http.redeem_invite(invite).await?;
     let keys = identity::KeyMaterial::generate();
-    let (device_id, _cert, short_code) = http
+    let (device_id, _cert, short_code, _screen_name) = http
         .upload_prekeys(account_id, &keys, Some(&auth_nonce))
         .await?;
     store.save(account_id, device_id, &keys)?;

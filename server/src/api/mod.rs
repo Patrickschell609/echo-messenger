@@ -4,6 +4,7 @@ pub mod invites;
 pub mod keys;
 pub mod messages;
 pub mod profiles;
+pub mod screen_names;
 
 use std::collections::HashMap;
 use std::sync::Arc;

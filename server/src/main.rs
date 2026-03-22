@@ -123,8 +123,11 @@ async fn main() -> anyhow::Result<()> {
         // Profiles
         .route("/v1/profile/update", post(api::profiles::update_profile))
         .route("/v1/profile/{device_id}", get(api::profiles::get_profile))
-        // Short code lookup
+        // Short code / screen name lookup
         .route("/v1/lookup/{code}", get(api::profiles::lookup_by_code))
+        // Screen names
+        .route("/v1/screen-name/check/{name}", get(api::screen_names::check_screen_name))
+        .route("/v1/screen-name/set", post(api::screen_names::set_screen_name))
         // Groups
         .route("/v1/groups", post(api::groups::create_group))
         .route("/v1/groups", get(api::groups::list_groups))
