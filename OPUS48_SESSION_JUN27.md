@@ -103,11 +103,38 @@ resyncs both sides (mirror the same order on send). Needs careful protocol desig
 NOT ship blind.
 
 ### Status
-- Diagnosis complete; tests committed as executable reproductions (suite green by
-  default, reproducers under `--ignored`).
-- **No product fix applied yet** — bugs #2 and #3 are crypto-core protocol changes
-  awaiting Ghost's sign-off. Bug #1 needs a client-side cert-refresh path
-  (re-fetch + save the cert the server already returns on key rotation).
+- **Bugs #2 and #3 FIXED** (Ghost signed off). Full suite green: 45 unit + 20 integration
+  + 10 transparency = 75 tests, echo-app compiles.
+- **Bug #1 (cert refresh) still open** — needs a client-side cert-refresh path (re-fetch +
+  save the cert the server already returns on key rotation; `poller.rs:980` currently
+  discards it).
+
+### Fix for #2 — responder epoch keypair (poller.rs)
+`echo-app/src-tauri/src/poller.rs` responder RatchetState now sets
+`my_epoch_pk = PqPublicKey(identity_state.pq_pk)`, `my_epoch_sk = keys.pq_sk` (its X4DH PQ
+prekey pair) instead of `None`. The dormant Flutter FFI builder (`ffi_api.rs`) has a TODO
+comment — fix it the same way if Flutter is revived (no active callers today).
+
+### Fix for #3 — lazy DH ratchet + folded PQ (shared/src/ratchet/session.rs)
+Converted the DH ratchet from **eager to lazy**: `dh_ratchet_receive` no longer pre-derives
+the next sending chain (it clears it; the next send ratchets from a root the peer shares).
+This removes the root asymmetry that desynced the epoch ratchet. The PQ epoch secret is now
+**folded into the DH ratchet's root step** via the existing `kdf_root_combined` (one KDF on
+both sides) instead of a separate `kdf_epoch` + extra DH step. `dh_ratchet_send` /
+`dh_ratchet_receive` take an `Option<&[u8]>` PQ secret; `epoch_ratchet_send`/`_receive` were
+replaced by `dh_ratchet_send_epoch` + inline receive handling in `decrypt`. The responder
+also DEFERS an epoch ratchet until it holds the peer's epoch key (self-heals; no error).
+
+**Known limitation:** the PQ KEM ciphertext rides on a single message, so messages within an
+epoch transition must be delivered in order (intra-chain reordering elsewhere is fine via
+skipped keys). Inherent to single-ciphertext PQ ratchets; transport delivers the queue in
+order. Covered by `test_long_distance_endurance` (in-order, crosses epoch on both sides) +
+`test_out_of_order_within_chain` (intra-chain reordering).
+
+### ⚠️ Deployment note for #2/#3
+This changes the wire/ratchet behavior of the epoch ratchet. Both boxes must run the new
+build together; in-flight sessions established under the old (broken) epoch logic should be
+re-established (they would never have survived an epoch ratchet anyway).
 
 ---
 

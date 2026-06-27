@@ -552,9 +552,14 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             local_identity: keys.identity_ed.public_key(),
             remote_identity: echo_crypto::IdentityPublicKey(sik),
             epoch_number: 0,
-            my_epoch_pk: None,
-            my_epoch_sk: None,
-            peer_epoch_pk: None,
+            // Bug #2 fix (Jun 27): the responder's initial epoch keypair MUST be its X4DH
+            // PQ prekey — that is the key the initiator encapsulates its first epoch ratchet
+            // to (initiator's peer_epoch_pk = bundle.pq_prekey). Leaving these None made the
+            // responder unable to decapsulate the first epoch ratchet (100-msg / 24h), so
+            // messages silently dropped after time passed.
+            my_epoch_pk: Some(echo_crypto::PqPublicKey(identity_state.pq_pk.clone())),
+            my_epoch_sk: Some(keys.pq_sk.clone()),
+            peer_epoch_pk: None, // learns the initiator's epoch key from their first epoch update
             epoch_message_count: 0,
             epoch_start_time: now,
             dh_ratchet_number: 0,

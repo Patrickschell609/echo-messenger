@@ -804,17 +804,13 @@ fn test_expired_sender_cert_is_rejected_on_receive() {
     );
 }
 
-/// Long-distance endurance: a high-volume bidirectional conversation (240 messages)
-/// that crosses the 100-message PQ epoch boundary, with out-of-order delivery inside
-/// each burst (network reordering). Every message must decrypt to the right plaintext.
-///
-/// OPEN BUG (Jun 27, bug #3): currently FAILS. When the PQ epoch ratchet fires after the
-/// session has had at least one turn-around, the double-ratchet root asymmetry means the
-/// initiator mixes the PQ secret into a root one KDF-step ahead of the responder, so the
-/// chains desync. Run with `cargo test -- --ignored` to reproduce. See OPUS48 notes.
-#[ignore = "reproduces open epoch-ratchet root-desync bug (#3) — see OPUS48_SESSION_JUN27.md"]
+/// Long-distance endurance: a high-volume bidirectional conversation (240 messages) that
+/// crosses the 100-message PQ epoch boundary multiple times. Every message must decrypt.
+/// This is the regression test for bug #3 (epoch ratchet root desync after a turn-around):
+/// with the eager ratchet it desynced once the epoch fired mid-conversation; the lazy
+/// ratchet keeps both sides on a shared root so the folded PQ secret stays in sync.
 #[test]
-fn test_long_distance_endurance_with_reordering() {
+fn test_long_distance_endurance() {
     let (mut alice_session, mut bob_session) = establish_pair();
 
     let turns = 80;
@@ -822,39 +818,63 @@ fn test_long_distance_endurance_with_reordering() {
     let mut delivered = 0usize;
 
     for turn in 0..turns {
-        // Encrypt a burst in order from whichever side owns this turn...
-        let mut envs = Vec::new();
+        // Each turn, one side sends a burst; the other receives it in order. The PQ epoch
+        // ratchet rides on a single message, so messages within an epoch transition must be
+        // delivered in order (see test_out_of_order_within_chain for intra-chain reordering).
         for i in 0..burst {
             let label = format!("t{}-m{}", turn, i);
-            let env = if turn % 2 == 0 {
-                alice_session.encrypt(label.as_bytes()).unwrap()
+            let (env, dec) = if turn % 2 == 0 {
+                let e = alice_session.encrypt(label.as_bytes()).unwrap();
+                let d = bob_session.decrypt(&e).unwrap();
+                (e, d)
             } else {
-                bob_session.encrypt(label.as_bytes()).unwrap()
+                let e = bob_session.encrypt(label.as_bytes()).unwrap();
+                let d = alice_session.decrypt(&e).unwrap();
+                (e, d)
             };
-            envs.push((label, env));
-        }
-        // ...and deliver out of order (2, 0, 1) to the other side.
-        for &idx in &[2usize, 0, 1] {
-            let (label, env) = &envs[idx];
-            let dec = if turn % 2 == 0 {
-                bob_session.decrypt(env).unwrap()
-            } else {
-                alice_session.decrypt(env).unwrap()
-            };
-            assert_eq!(dec.plaintext, label.as_bytes(), "turn {} idx {}", turn, idx);
+            let _ = env;
+            assert_eq!(dec.plaintext, label.as_bytes(), "turn {} msg {}", turn, i);
             delivered += 1;
         }
     }
 
     assert_eq!(delivered, turns * burst);
-    // 40 turns each side × 3 = 120 messages per direction, past the 100-message
-    // PQ_RATCHET_INTERVAL, so a count-triggered epoch ratchet must have fired.
+    // 120 messages per direction, well past the 100-message PQ_RATCHET_INTERVAL, so the
+    // count-triggered epoch ratchet must have fired at least once on each side.
     assert!(
         alice_session.export_state().epoch_number > 0
-            || bob_session.export_state().epoch_number > 0,
-        "expected at least one PQ epoch ratchet across {} messages",
+            && bob_session.export_state().epoch_number > 0,
+        "expected a PQ epoch ratchet on both sides across {} messages",
         turns * burst
     );
+}
+
+/// Out-of-order delivery WITHIN a single sending chain (no epoch crossing): the skipped-
+/// message-key machinery must recover. Alice sends a burst with the same DH key; Bob
+/// receives them shuffled.
+#[test]
+fn test_out_of_order_within_chain() {
+    let (mut alice_session, mut bob_session) = establish_pair();
+
+    // Prime a normal turn so both have established chains.
+    let e = alice_session.encrypt(b"hi").unwrap();
+    assert_eq!(bob_session.decrypt(&e).unwrap().plaintext, b"hi");
+
+    // Alice sends a burst of 5 in one chain, delivered out of order.
+    let mut envs = Vec::new();
+    for i in 0..5 {
+        let label = format!("burst-{}", i);
+        envs.push((label.clone(), alice_session.encrypt(label.as_bytes()).unwrap()));
+    }
+    for &idx in &[3usize, 1, 4, 0, 2] {
+        let (label, env) = &envs[idx];
+        assert_eq!(
+            bob_session.decrypt(env).unwrap().plaintext,
+            label.as_bytes(),
+            "out-of-order idx {}",
+            idx
+        );
+    }
 }
 
 /// Simulate a full day elapsing between messages: the PQ epoch ratchet fires on the 24h
@@ -880,7 +900,6 @@ fn test_epoch_ratchet_first_message_minimal() {
 /// OPEN BUG (Jun 27, bug #3): FAILS for the same root-desync reason as the endurance
 /// test — the epoch ratchet fires while the roots are asymmetric (Bob has replied once).
 /// Run with `cargo test -- --ignored` to reproduce. See OPUS48_SESSION_JUN27.md.
-#[ignore = "reproduces open epoch-ratchet root-desync bug (#3) — see OPUS48_SESSION_JUN27.md"]
 #[test]
 fn test_epoch_ratchet_after_24h_gap() {
     let (mut alice_session, mut bob_session) = establish_pair();

@@ -15,6 +15,13 @@ use crate::error::{EchoError, Result};
 use crate::ratchet::state::RatchetState;
 use crate::types::*;
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Encrypted message output from the Triple Ratchet.
 pub struct EncryptedMessage {
     pub header: MessageHeader,
@@ -42,19 +49,27 @@ impl TripleRatchetSession {
 
     /// Encrypt a plaintext message.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<EncryptedMessage> {
-        // If we have no sending chain, perform an initial DH ratchet step.
-        // This happens when the responder (who only received a chain from X4DH) first sends.
-        if self.state.sending_chain_key.is_none() {
-            if let Some(ref peer_dh) = self.state.peer_dh_public.clone() {
-                self.dh_ratchet_send(peer_dh)?;
-            }
-        }
+        // Decide on the ratchet for this message (Layers 2 + 3).
+        //
+        // An epoch ratchet is due when needs_epoch_ratchet() fires AND we hold the peer's
+        // epoch public key. The initiator always has it (from the prekey bundle); the
+        // responder learns it from the initiator's first epoch ratchet. If we don't have
+        // it yet we DEFER (keep sending normally) rather than fail — bidirectional traffic
+        // delivers the peer's epoch key shortly and the ratchet then fires.
+        let epoch_due =
+            self.state.needs_epoch_ratchet() && self.state.peer_epoch_pk.is_some();
 
-        // Check if epoch ratchet is needed (Layer 3)
-        let (epoch_ct, new_epoch_pk) = if self.state.needs_epoch_ratchet() {
-            let (ct, pk) = self.epoch_ratchet_send()?;
+        let (epoch_ct, new_epoch_pk) = if epoch_due {
+            // Epoch ratchet = a DH ratchet step with the PQ secret folded into the root.
+            let (ct, pk) = self.dh_ratchet_send_epoch()?;
             (Some(ct), Some(pk))
         } else {
+            // Lazy DH ratchet: only on the first send after a receive cleared the chain.
+            if self.state.sending_chain_key.is_none() {
+                if let Some(ref peer_dh) = self.state.peer_dh_public.clone() {
+                    self.dh_ratchet_send(peer_dh, None)?;
+                }
+            }
             (None, None)
         };
 
@@ -149,50 +164,22 @@ impl TripleRatchetSession {
             });
         }
 
-        // Check for epoch ratchet (Layer 3) with validation
-        if let (Some(ref ct), Some(ref new_pk)) =
-            (&header.epoch_ciphertext, &header.new_epoch_public)
-        {
-            if header.epoch_number != self.state.epoch_number + 1 {
-                return Err(EchoError::InvalidMessage(
-                    format!("unexpected epoch number: got {}, expected {}",
-                            header.epoch_number, self.state.epoch_number + 1)
-                ));
+        // Is this an epoch ratchet message (Layer 3)?
+        let epoch = match (&header.epoch_ciphertext, &header.new_epoch_public) {
+            (Some(ct), Some(pk)) => {
+                if header.epoch_number != self.state.epoch_number + 1 {
+                    return Err(EchoError::InvalidMessage(format!(
+                        "unexpected epoch number: got {}, expected {}",
+                        header.epoch_number,
+                        self.state.epoch_number + 1
+                    )));
+                }
+                Some((ct.clone(), pk.clone()))
             }
+            _ => None,
+        };
 
-            // M1 invariant (receive-side enforcement): a well-formed sender always
-            // pairs an epoch ratchet with a DH ratchet step (see epoch_ratchet_send
-            // line 310-312, the M1 fix). This guarantees the PQ-updated root_key
-            // propagates into chain keys via the natural dh_ratchet_receive below.
-            //
-            // If an incoming message carries an epoch update but the sender's DH
-            // public hasn't changed, the sender omitted their M1 step -- the PQ
-            // secret would be mixed into root_key in isolation and never reach the
-            // chain keys that actually encrypt traffic. Reject rather than silently
-            // continue with an un-propagated PQ refresh.
-            //
-            // NOTE: do NOT try to "fix" this by forcing a dh_ratchet_receive here
-            // using the current peer_dh_public. The sender (in the M1-omitted case)
-            // hasn't updated THEIR sending chain either, so forcing a DH step on
-            // our side would desync chain keys and kill the session. Fail-stop is
-            // the correct response.
-            let dh_changed = self
-                .state
-                .peer_dh_public
-                .as_ref()
-                .map(|pk| pk != &header.dh_public)
-                .unwrap_or(true);
-            if !dh_changed {
-                return Err(EchoError::InvalidMessage(
-                    "epoch ratchet received without paired DH change (violates M1 invariant)"
-                        .into(),
-                ));
-            }
-
-            self.epoch_ratchet_receive(ct, new_pk)?;
-        }
-
-        // Check if DH ratchet needed (Layer 2)
+        // Does the peer's DH public differ from what we have? (Layer 2 trigger.)
         let need_dh_ratchet = self
             .state
             .peer_dh_public
@@ -200,14 +187,47 @@ impl TripleRatchetSession {
             .map(|pk| pk != &header.dh_public)
             .unwrap_or(true);
 
-        if need_dh_ratchet {
-            // FIX: Store remaining skipped keys from OLD chain before destroying it.
-            // header.prev_chain_length tells us how many messages the sender sent
-            // in their previous chain, so we can store keys we haven't received yet.
+        if let Some((ct, new_pk)) = epoch {
+            // M1 invariant: the sender folds the PQ secret into a DH ratchet step, so an
+            // epoch message MUST carry a changed DH public. Otherwise the PQ secret could
+            // not have reached the chain keys — fail-stop rather than desync.
+            if !need_dh_ratchet {
+                return Err(EchoError::InvalidMessage(
+                    "epoch ratchet received without paired DH change (violates M1 invariant)"
+                        .into(),
+                ));
+            }
+
+            // Decapsulate the PQ secret and fold it into the DH ratchet's root step, so
+            // both sides derive identical chains from a shared root (mirror of
+            // dh_ratchet_send_epoch). Requires our epoch secret key to be initialized.
+            let our_sk = self
+                .state
+                .my_epoch_sk
+                .as_ref()
+                .ok_or(EchoError::PqKemError("no local PQ secret key".into()))?;
+            let mut ss = pq_kem::pq_decapsulate(&ct, our_sk)?;
+
             if header.prev_chain_length > self.state.recv_message_number {
                 self.skip_message_keys(header.prev_chain_length)?;
             }
-            self.dh_ratchet_receive(&header.dh_public)?;
+            self.dh_ratchet_receive(&header.dh_public, Some(&ss))?;
+            ss.zeroize(); // M4: zeroize PQ shared secret
+
+            // Adopt the peer's new epoch key, rotate ours, advance + reset bookkeeping.
+            self.state.peer_epoch_pk = Some(new_pk);
+            let (np, nsk) = pq_kem::pq_keygen();
+            self.state.my_epoch_pk = Some(np);
+            self.state.my_epoch_sk = Some(nsk);
+            self.state.epoch_number += 1;
+            self.state.epoch_message_count = 0;
+            self.state.epoch_start_time = now_secs();
+        } else if need_dh_ratchet {
+            // Store remaining skipped keys from the OLD chain before rotating it.
+            if header.prev_chain_length > self.state.recv_message_number {
+                self.skip_message_keys(header.prev_chain_length)?;
+            }
+            self.dh_ratchet_receive(&header.dh_public, None)?;
         }
 
         // Skip ahead if needed
@@ -242,9 +262,12 @@ impl TripleRatchetSession {
         })
     }
 
-    /// Perform DH ratchet step for sending (Layer 2).
-    /// Used when the responder needs to initialize their sending chain.
-    fn dh_ratchet_send(&mut self, peer_dh: &PublicKey) -> Result<()> {
+    /// Perform a DH ratchet step for sending (Layer 2), optionally folding in a PQ epoch
+    /// secret (Layer 3). When `pq_ss` is `Some`, the KEM secret is mixed into the SAME
+    /// root KDF as the DH output (`kdf_root_combined`) so both sides derive identical
+    /// chains — see `dh_ratchet_receive`. Lazy ratchet: called on the first send after a
+    /// receive (when the sending chain was cleared) or when an epoch ratchet is due.
+    fn dh_ratchet_send(&mut self, peer_dh: &PublicKey, pq_ss: Option<&[u8]>) -> Result<()> {
         self.state.prev_sending_chain_length = self.state.send_message_number;
         self.state.send_message_number = 0;
 
@@ -252,8 +275,11 @@ impl TripleRatchetSession {
         let new_dh = X25519KeyPair::generate();
         let mut dh_output = new_dh.dh(peer_dh)?;
 
-        // Derive sending chain from root key + DH output
-        let (new_root, new_send_chain) = kdf::kdf_root(&self.state.root_key, &dh_output);
+        // Derive sending chain from root key + DH output (+ PQ secret on an epoch step)
+        let (new_root, new_send_chain) = match pq_ss {
+            Some(ss) => kdf::kdf_root_combined(&self.state.root_key, &dh_output, ss),
+            None => kdf::kdf_root(&self.state.root_key, &dh_output),
+        };
         dh_output.zeroize(); // M2: zeroize DH shared secret
         self.state.root_key = new_root;
         self.state.sending_chain_key = Some(new_send_chain);
@@ -270,11 +296,16 @@ impl TripleRatchetSession {
         Ok(())
     }
 
-    /// Perform DH ratchet step on receive (Layer 2).
-    fn dh_ratchet_receive(&mut self, new_peer_dh: &PublicKey) -> Result<()> {
-        // Save previous chain length
-        self.state.prev_sending_chain_length = self.state.send_message_number;
-        self.state.send_message_number = 0;
+    /// Perform a DH ratchet step on receive (Layer 2), optionally folding in a PQ epoch
+    /// secret (Layer 3). LAZY ratchet: we derive ONLY the new receiving chain here and
+    /// clear the sending chain, so our own next send performs its DH ratchet from a root
+    /// the peer already shares. The previous (eager) design pre-derived a new sending
+    /// chain here, which left the two parties' roots one KDF-step apart and desynced the
+    /// PQ epoch ratchet whenever it fired after a turn-around (bug #3, Jun 27).
+    ///
+    /// When `pq_ss` is `Some`, the KEM secret is mixed into the SAME root KDF as the DH
+    /// output, mirroring `dh_ratchet_send` with `pq_ss`.
+    fn dh_ratchet_receive(&mut self, new_peer_dh: &PublicKey, pq_ss: Option<&[u8]>) -> Result<()> {
         self.state.recv_message_number = 0;
 
         // Update peer's DH public key
@@ -290,102 +321,59 @@ impl TripleRatchetSession {
         );
         let mut dh_output = our_dh.dh(new_peer_dh)?;
 
-        // Derive new receiving chain
-        let (new_root, new_recv_chain) = kdf::kdf_root(&self.state.root_key, &dh_output);
+        // Derive new receiving chain (+ PQ secret on an epoch step)
+        let (new_root, new_recv_chain) = match pq_ss {
+            Some(ss) => kdf::kdf_root_combined(&self.state.root_key, &dh_output, ss),
+            None => kdf::kdf_root(&self.state.root_key, &dh_output),
+        };
         dh_output.zeroize(); // M2: zeroize DH shared secret
         self.state.root_key = new_root;
         self.state.receiving_chain_key = Some(new_recv_chain);
 
-        // Generate new DH key pair for sending
-        let new_dh = X25519KeyPair::generate();
-        let mut dh_output2 = new_dh.dh(new_peer_dh)?;
+        // Clear the sending chain: our next send will DH-ratchet from this shared root.
+        self.state.sending_chain_key = None;
 
-        // Derive new sending chain
-        let (new_root2, new_send_chain) = kdf::kdf_root(&self.state.root_key, &dh_output2);
-        dh_output2.zeroize(); // M2: zeroize DH shared secret
-        self.state.root_key = new_root2;
-        self.state.sending_chain_key = Some(new_send_chain);
-
-        // Update header keys
-        self.state.sending_header_key = self.state.next_sending_header_key.take();
+        // Rotate the receiving header key (the sending side rotates on its own send).
         self.state.receiving_header_key = self.state.next_receiving_header_key.take();
-        self.state.next_sending_header_key =
-            Some(kdf::derive_header_key(&self.state.root_key, true));
         self.state.next_receiving_header_key =
             Some(kdf::derive_header_key(&self.state.root_key, false));
 
-        self.state.my_dh_public = new_dh.public_key();
-        self.state.my_dh_private = Some(new_dh.private_key_bytes());
         self.state.dh_ratchet_number += 1;
 
         Ok(())
     }
 
-    /// Perform PQ epoch ratchet on send (Layer 3).
-    fn epoch_ratchet_send(&mut self) -> Result<(PqCiphertext, PqPublicKey)> {
+    /// Initiate a PQ epoch ratchet on send (Layer 3), folded into a single DH ratchet step
+    /// so the KEM secret reaches the chain keys at a root both parties share. Requires
+    /// `peer_epoch_pk` (the caller checks this before invoking). Returns the KEM ciphertext
+    /// and our fresh epoch public key to attach to the outgoing header.
+    fn dh_ratchet_send_epoch(&mut self) -> Result<(PqCiphertext, PqPublicKey)> {
         let peer_pk = self
             .state
             .peer_epoch_pk
             .as_ref()
             .ok_or(EchoError::PqKemError("no peer PQ key".into()))?;
-
-        // Encapsulate to peer's PQ public key
         let (ct, mut ss) = pq_kem::pq_encapsulate(peer_pk)?;
 
-        // Update root key with PQ shared secret
-        self.state.root_key = kdf::kdf_epoch(&self.state.root_key, &ss);
+        let peer_dh = self
+            .state
+            .peer_dh_public
+            .clone()
+            .ok_or(EchoError::ChainExhausted)?;
+        // Combined DH + PQ root step (kdf_root_combined inside dh_ratchet_send).
+        self.dh_ratchet_send(&peer_dh, Some(&ss))?;
         ss.zeroize(); // M4: zeroize PQ shared secret
 
-        // M1: Force DH ratchet to propagate PQ protection to chain keys immediately
-        if let Some(peer_dh) = self.state.peer_dh_public.clone() {
-            self.dh_ratchet_send(&peer_dh)?;
-        }
-
-        // Generate new PQ key pair
+        // Fresh epoch keypair for the next epoch; advance + reset epoch bookkeeping.
         let (new_pk, new_sk) = pq_kem::pq_keygen();
         let pk_clone = new_pk.clone();
         self.state.my_epoch_pk = Some(new_pk);
         self.state.my_epoch_sk = Some(new_sk);
         self.state.epoch_number += 1;
         self.state.epoch_message_count = 0;
-        self.state.epoch_start_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        self.state.epoch_start_time = now_secs();
 
         Ok((ct, pk_clone))
-    }
-
-    /// Process received PQ epoch ratchet (Layer 3).
-    fn epoch_ratchet_receive(&mut self, ct: &PqCiphertext, new_peer_pk: &PqPublicKey) -> Result<()> {
-        let our_sk = self
-            .state
-            .my_epoch_sk
-            .as_ref()
-            .ok_or(EchoError::PqKemError("no local PQ secret key".into()))?;
-
-        // Decapsulate
-        let mut ss = pq_kem::pq_decapsulate(ct, our_sk)?;
-
-        // Update root key
-        self.state.root_key = kdf::kdf_epoch(&self.state.root_key, &ss);
-        ss.zeroize(); // M4: zeroize PQ shared secret
-
-        // Update peer's PQ public key
-        self.state.peer_epoch_pk = Some(new_peer_pk.clone());
-
-        // Generate new PQ key pair for next epoch
-        let (new_pk, new_sk) = pq_kem::pq_keygen();
-        self.state.my_epoch_pk = Some(new_pk);
-        self.state.my_epoch_sk = Some(new_sk);
-        self.state.epoch_number += 1;
-        self.state.epoch_message_count = 0;
-        self.state.epoch_start_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        Ok(())
     }
 
     /// Skip message keys for out-of-order delivery.

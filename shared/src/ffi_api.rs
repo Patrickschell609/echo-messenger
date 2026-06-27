@@ -471,6 +471,11 @@ pub fn ffi_build_responder_state(
         local_identity: our_identity,
         remote_identity: remote_id,
         epoch_number: 0,
+        // BUG #2 (Jun 27): like the Tauri poller, the responder's initial epoch keypair must
+        // be its X4DH PQ prekey (the key the initiator encapsulates its first epoch ratchet
+        // to). This FFI builder doesn't currently receive the PQ keypair — when the Flutter
+        // client is revived, add pq_public/pq_secret params and set these to that pair, or
+        // the first epoch ratchet (100-msg / 24h) will silently drop. See OPUS48 notes.
         my_epoch_pk: None,
         my_epoch_sk: None,
         peer_epoch_pk: None,
