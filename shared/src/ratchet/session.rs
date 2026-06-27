@@ -159,6 +159,36 @@ impl TripleRatchetSession {
                             header.epoch_number, self.state.epoch_number + 1)
                 ));
             }
+
+            // M1 invariant (receive-side enforcement): a well-formed sender always
+            // pairs an epoch ratchet with a DH ratchet step (see epoch_ratchet_send
+            // line 310-312, the M1 fix). This guarantees the PQ-updated root_key
+            // propagates into chain keys via the natural dh_ratchet_receive below.
+            //
+            // If an incoming message carries an epoch update but the sender's DH
+            // public hasn't changed, the sender omitted their M1 step -- the PQ
+            // secret would be mixed into root_key in isolation and never reach the
+            // chain keys that actually encrypt traffic. Reject rather than silently
+            // continue with an un-propagated PQ refresh.
+            //
+            // NOTE: do NOT try to "fix" this by forcing a dh_ratchet_receive here
+            // using the current peer_dh_public. The sender (in the M1-omitted case)
+            // hasn't updated THEIR sending chain either, so forcing a DH step on
+            // our side would desync chain keys and kill the session. Fail-stop is
+            // the correct response.
+            let dh_changed = self
+                .state
+                .peer_dh_public
+                .as_ref()
+                .map(|pk| pk != &header.dh_public)
+                .unwrap_or(true);
+            if !dh_changed {
+                return Err(EchoError::InvalidMessage(
+                    "epoch ratchet received without paired DH change (violates M1 invariant)"
+                        .into(),
+                ));
+            }
+
             self.epoch_ratchet_receive(ct, new_pk)?;
         }
 

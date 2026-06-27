@@ -50,7 +50,10 @@ pub async fn create_account(
     let screen_name_result = if !screen_name.is_empty() {
         match auth_http_tmp.set_screen_name(&screen_name).await {
             Ok(resp) => Some(resp.screen_name),
-            Err(e) => return Err(format!("Screen name error: {}", e)),
+            Err(e) => {
+                tracing::warn!("Screen name claim failed (non-fatal): {}", e);
+                None
+            }
         }
     } else {
         None

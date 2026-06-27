@@ -233,12 +233,9 @@ const SignOn = {
       App.toastError('Enter an invite code');
       return;
     }
-    if (!screenName) {
-      App.toastError('Pick a screen name');
-      return;
-    }
-    if (!this._screenNameAvailable) {
-      App.toastError('Screen name is not available');
+    // Screen name is optional — can be set later from buddy list
+    if (screenName && !this._screenNameAvailable) {
+      App.toastError('Screen name is not available — clear it to skip');
       return;
     }
 

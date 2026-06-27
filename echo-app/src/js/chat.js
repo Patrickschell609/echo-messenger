@@ -347,25 +347,18 @@ const Chat = {
     }
 
     try {
-      // Prevent dual-initiator race: only the lower UUID initiates.
-      // The higher UUID waits for the incoming PreKey message, and the
-      // poller builds a responder session automatically.
-      const ourDeviceId = await API.getDeviceId();
-      if (ourDeviceId < this.deviceId) {
-        // We are the lower UUID — we initiate the session
-        console.log('[ECHO] We are lower UUID, initiating session');
-        const result = await API.establishSession(this.deviceId);
-        if (!this.hasSession) {
-          this.hasSession = true;
-          this.establishing = false;
-          this.onSessionReady(result);
-        }
-      } else {
-        // We are the higher UUID — wait for peer's PreKey message
-        // The poller will emit SESSION_ESTABLISHED when it arrives
-        console.log('[ECHO] We are higher UUID, waiting for peer to initiate');
-        this.establishing = true;
-        // The establishing spinner stays visible; onSessionEstablished() will clear it
+      // Always initiate -- the Rust side handles dedup via session.rs session_exists()
+      // check, and the poller has a dual-initiator tiebreaker (higher device_id wins)
+      // at poller.rs:464-474 to resolve races when both sides establish simultaneously.
+      // Mirrors the Mar 21 2026 fix applied to buddylist.js autoEstablish(); the same
+      // asymmetry had been left in place here, causing higher-UUID users to hang on
+      // "Connecting..." forever when they opened a chat without an existing session.
+      console.log('[ECHO] Establishing session from chat');
+      const result = await API.establishSession(this.deviceId);
+      if (!this.hasSession) {
+        this.hasSession = true;
+        this.establishing = false;
+        this.onSessionReady(result);
       }
     } catch (e) {
       this.establishing = false;
