@@ -179,11 +179,15 @@ pub async fn establish_session(
 
     let wire_payload = bincode::serialize(&wire_msg).map_err(|e| e.to_string())?;
 
-    // Seal with sender cert
+    // Seal with sender cert.
+    // M4 (Apr 21 audit): require the server-signed cert — a self-built fallback has a
+    // zero server_signature and is rejected by the recipient's unseal_message(), so the
+    // PreKey message would be silently dropped. Hard-fail rather than ship a dead cert.
     let cert: echo_crypto::sealed_sender::SenderCertificate = {
         let vault = state.vault.lock().unwrap();
-        vault.load_sender_cert()
-            .unwrap_or_else(|| identity::build_sender_cert(&identity_state))
+        vault.load_sender_cert().ok_or_else(|| {
+            "missing server-signed sender certificate — re-register to obtain one".to_string()
+        })?
     };
     let envelope = echo_crypto::sealed_sender::seal_message(
         &meta.recipient_dh_key,

@@ -41,17 +41,24 @@ impl X4DH {
         our_identity_dh: &X25519KeyPair,
         their_bundle: &PrekeyBundle,
     ) -> Result<X4DHInitResult> {
-        // C3: Verify Bob's identity_dh_key is bound to his Ed25519 identity
-        if !their_bundle.identity_dh_key_signature.is_empty() {
-            let mut dh_bind_msg = Vec::new();
-            dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
-            dh_bind_msg.extend_from_slice(&their_bundle.identity_dh_key.0);
-            Ed25519KeyPair::verify(
-                &their_bundle.identity_key,
-                &dh_bind_msg,
-                &their_bundle.identity_dh_key_signature,
-            )?;
+        // C3: Verify Bob's identity_dh_key is bound to his Ed25519 identity.
+        // H2 (Apr 21 audit): the binding check is MANDATORY. An empty signature
+        // must not silently skip it — otherwise a compromised server could strip
+        // the signature from the prekey bundle and defeat the C3 identity binding,
+        // enabling an unknown-key-share attack.
+        if their_bundle.identity_dh_key_signature.is_empty() {
+            return Err(EchoError::InvalidMessage(
+                "prekey bundle missing identity_dh_key binding signature (C3)".into(),
+            ));
         }
+        let mut dh_bind_msg = Vec::new();
+        dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
+        dh_bind_msg.extend_from_slice(&their_bundle.identity_dh_key.0);
+        Ed25519KeyPair::verify(
+            &their_bundle.identity_key,
+            &dh_bind_msg,
+            &their_bundle.identity_dh_key_signature,
+        )?;
 
         // Verify Bob's signed prekey signature
         let spk_bytes = &their_bundle.signed_prekey.0;
@@ -127,14 +134,23 @@ impl X4DH {
         their_ephemeral: &PublicKey,
         pq_ciphertext: &PqCiphertext,
     ) -> Result<X4DHResponseResult> {
-        // C4: Verify Alice's identity_dh_key is bound to her Ed25519 identity
-        if let (Some(ed_key), Some(sig)) = (their_identity_ed, their_dh_signature) {
-            if !sig.is_empty() {
-                let mut dh_bind_msg = Vec::new();
-                dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
-                dh_bind_msg.extend_from_slice(&their_identity_dh_key.0);
-                Ed25519KeyPair::verify(ed_key, &dh_bind_msg, sig)?;
-            }
+        // C4: Verify Alice's identity_dh_key is bound to her Ed25519 identity.
+        // H1/H2 (Apr 21 audit): both the identity key and the binding signature are
+        // MANDATORY. The session KDF below binds to `their_identity_ed` (M8); if it
+        // were missing we used to fall back to all-zeros, binding the session to a
+        // well-known constant and defeating M8. And an empty/absent signature used to
+        // skip the C4 check entirely. Reject both cases rather than weaken the binding.
+        let their_ed = their_identity_ed.ok_or_else(|| {
+            EchoError::InvalidMessage("prekey message missing initiator Ed25519 identity (M8)".into())
+        })?;
+        let dh_sig = their_dh_signature.filter(|s| !s.is_empty()).ok_or_else(|| {
+            EchoError::InvalidMessage("prekey message missing identity_dh_key binding signature (C4)".into())
+        })?;
+        {
+            let mut dh_bind_msg = Vec::new();
+            dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
+            dh_bind_msg.extend_from_slice(&their_identity_dh_key.0);
+            Ed25519KeyPair::verify(their_ed, &dh_bind_msg, dh_sig)?;
         }
         // DH1: SPK_B × IK_A (X25519 identity DH key)
         let dh1 = our_signed_prekey.dh(their_identity_dh_key)?;
@@ -161,14 +177,11 @@ impl X4DH {
         }
         secrets.push(&pq_ss);
 
-        // M8: Bind session to both parties' identities (initiator=them, responder=us)
-        // Use their_identity_ed for Alice's identity (initiator), our identity for Bob (responder)
-        let their_ed = their_identity_ed
-            .map(|k| k.0.as_slice())
-            .unwrap_or(&[0u8; 32]);
+        // M8: Bind session to both parties' identities (initiator=them, responder=us).
+        // `their_ed` was validated as present above (H1) — no zero fallback.
         let (root_key, chain_key) = kdf::kdf_session(
             &secrets,
-            their_ed,
+            &their_ed.0,
             &_our_identity.public_key().0,
         );
 

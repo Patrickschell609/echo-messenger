@@ -128,11 +128,15 @@ pub async fn send_message(
 
     let wire_payload = bincode::serialize(&wire_msg).map_err(|e| e.to_string())?;
 
-    // Load server-signed sender cert from vault, fall back to self-built if not available
+    // M4 (Apr 21 audit): require the server-signed sender cert. A self-built cert
+    // carries a zero server_signature, which the recipient's unseal_message() rejects
+    // (sealed_sender::verify_sender_cert). Silently shipping one means the message is
+    // dropped on the far end with the sender none the wiser — hard-fail instead.
     let cert: echo_crypto::sealed_sender::SenderCertificate = {
         let vault = state.vault.lock().unwrap();
-        vault.load_sender_cert()
-            .unwrap_or_else(|| identity::build_sender_cert(&identity_state))
+        vault.load_sender_cert().ok_or_else(|| {
+            "missing server-signed sender certificate — re-register to obtain one".to_string()
+        })?
     };
     let envelope = echo_crypto::sealed_sender::seal_message(
         &session_meta_loaded.recipient_dh_key,
@@ -413,11 +417,14 @@ pub async fn send_file(
 
     let wire_payload = bincode::serialize(&wire_msg).map_err(|e| e.to_string())?;
 
+    // M4 (Apr 21 audit): require the server-signed sender cert — a self-built fallback
+    // has a zero server_signature and is rejected by the recipient, silently dropping
+    // the message. Hard-fail instead.
     let cert: echo_crypto::sealed_sender::SenderCertificate = {
         let vault = state.vault.lock().unwrap();
-        vault
-            .load_sender_cert()
-            .unwrap_or_else(|| identity::build_sender_cert(&identity_state))
+        vault.load_sender_cert().ok_or_else(|| {
+            "missing server-signed sender certificate — re-register to obtain one".to_string()
+        })?
     };
     let envelope = echo_crypto::sealed_sender::seal_message(
         &session_meta_loaded.recipient_dh_key,
@@ -579,11 +586,14 @@ async fn send_encrypted_payload(
 
     let wire_payload = bincode::serialize(&wire_msg).map_err(|e| e.to_string())?;
 
+    // M4 (Apr 21 audit): require the server-signed sender cert — a self-built fallback
+    // has a zero server_signature and is rejected by the recipient, silently dropping
+    // the message. Hard-fail instead.
     let cert: echo_crypto::sealed_sender::SenderCertificate = {
         let vault = state.vault.lock().unwrap();
-        vault
-            .load_sender_cert()
-            .unwrap_or_else(|| identity::build_sender_cert(&identity_state))
+        vault.load_sender_cert().ok_or_else(|| {
+            "missing server-signed sender certificate — re-register to obtain one".to_string()
+        })?
     };
     let envelope = echo_crypto::sealed_sender::seal_message(
         &session_meta_loaded.recipient_dh_key,

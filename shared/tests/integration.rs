@@ -628,3 +628,80 @@ fn test_padding_constant_size() {
     );
     assert_eq!(unpad_message(&long).unwrap(), long_msg);
 }
+
+// --- Apr 21 audit hardening: identity-binding bypass regression tests ---
+
+/// H2 (initiator): an empty `identity_dh_key_signature` in the prekey bundle must be
+/// rejected, not silently skipped. A compromised server could otherwise strip the
+/// signature to defeat the C3 identity binding (unknown-key-share).
+#[test]
+fn test_x4dh_initiate_rejects_empty_dh_binding_sig() {
+    let alice = UserKeys::generate(1);
+    let bob = UserKeys::generate(2);
+
+    let mut bundle = bob.bundle();
+    bundle.identity_dh_key_signature = vec![]; // server stripped the binding signature
+
+    let result = X4DH::initiate(&alice.identity_ed, &alice.identity_dh, &bundle);
+    assert!(
+        result.is_err(),
+        "missing identity_dh_key binding signature must be rejected (H2)"
+    );
+}
+
+/// H1 (responder): a prekey message missing the initiator's Ed25519 identity must be
+/// rejected. The old code fell back to all-zeros in the M8 session KDF, binding the
+/// session to a well-known constant.
+#[test]
+fn test_x4dh_respond_rejects_missing_identity_ed() {
+    let alice = UserKeys::generate(1);
+    let bob = UserKeys::generate(2);
+    let bob_bundle = bob.bundle();
+    let init = X4DH::initiate(&alice.identity_ed, &alice.identity_dh, &bob_bundle).unwrap();
+
+    let dh_sig =
+        alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat());
+    let result = X4DH::respond(
+        &bob.identity_ed,
+        &bob.identity_dh,
+        &bob.signed_prekey,
+        Some(&bob.one_time_prekey),
+        &bob.pq_sk,
+        &init.identity_dh_public,
+        None, // no initiator identity — must be rejected, not zero-bound
+        Some(&dh_sig),
+        &init.ephemeral_public,
+        &init.pq_ciphertext,
+    );
+    assert!(
+        result.is_err(),
+        "missing initiator Ed25519 identity must be rejected (H1)"
+    );
+}
+
+/// H2 (responder): a prekey message with a missing/empty DH-binding signature must be
+/// rejected, not silently skipped.
+#[test]
+fn test_x4dh_respond_rejects_missing_dh_binding_sig() {
+    let alice = UserKeys::generate(1);
+    let bob = UserKeys::generate(2);
+    let bob_bundle = bob.bundle();
+    let init = X4DH::initiate(&alice.identity_ed, &alice.identity_dh, &bob_bundle).unwrap();
+
+    let result = X4DH::respond(
+        &bob.identity_ed,
+        &bob.identity_dh,
+        &bob.signed_prekey,
+        Some(&bob.one_time_prekey),
+        &bob.pq_sk,
+        &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        None, // no DH-binding signature — must be rejected
+        &init.ephemeral_public,
+        &init.pq_ciphertext,
+    );
+    assert!(
+        result.is_err(),
+        "missing DH-binding signature must be rejected (H2)"
+    );
+}
