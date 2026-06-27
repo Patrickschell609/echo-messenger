@@ -176,7 +176,6 @@ fn bob_initial_state(
     root_key: RootKey,
     chain_key: ChainKey,
 ) -> RatchetState {
-    let (pq_pk, pq_sk) = pq_kem::pq_keygen();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -186,9 +185,14 @@ fn bob_initial_state(
         local_identity: bob.identity_ed.public_key(),
         remote_identity: alice.identity_ed.public_key(),
         epoch_number: 0,
-        my_epoch_pk: Some(pq_pk),
-        my_epoch_sk: Some(pq_sk),
-        peer_epoch_pk: None, // will get Alice's PQ key from her messages
+        // Responder's initial epoch keypair MUST be its X4DH PQ prekey — that is the key
+        // the initiator encapsulates its first epoch ratchet to (initiator sets
+        // peer_epoch_pk = bundle.pq_prekey). A fresh/unrelated keypair (or None, as the
+        // production poller currently sets) makes the responder unable to decapsulate the
+        // first epoch ratchet at the 100-msg / 24h boundary.
+        my_epoch_pk: Some(bob.pq_pk.clone()),
+        my_epoch_sk: Some(bob.pq_sk.clone()),
+        peer_epoch_pk: None, // learns Alice's epoch key from her first epoch update
         epoch_message_count: 0,
         epoch_start_time: now,
         dh_ratchet_number: 0,
@@ -704,4 +708,213 @@ fn test_x4dh_respond_rejects_missing_dh_binding_sig() {
         result.is_err(),
         "missing DH-binding signature must be rejected (H2)"
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Long-distance / time-passing tests (Jun 27 2026)
+//
+// Models the field report: "two boxes chat fine for a few messages, then after
+// time passes sending stops working." Covers both time-driven mechanisms — the
+// 24h sender-cert expiry and the 24h/100-message PQ epoch ratchet — plus high
+// volume and out-of-order delivery (network reordering / latency).
+// ─────────────────────────────────────────────────────────────
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Build a server-signed + counter-signed sender cert with an explicit expiry, so we
+/// can simulate a cert that has aged past its 24h validity window.
+fn sender_cert_with_expiry(user: &UserKeys, expiry: u64) -> SenderCertificate {
+    let server_key = test_server_key();
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&user.device_id.0);
+    msg.extend_from_slice(&user.identity_ed.public_key().0);
+    msg.extend_from_slice(&expiry.to_le_bytes());
+    let server_sig = server_key.sign(&msg);
+
+    let mut cert = SenderCertificate {
+        sender_identity: user.identity_ed.public_key(),
+        sender_device_id: user.device_id.clone(),
+        expiry,
+        server_signature: server_sig,
+        sender_signature: vec![],
+    };
+    sealed_sender::countersign_sender_cert(&mut cert, &user.identity_ed.private_key_bytes().0);
+    cert
+}
+
+/// Run X4DH and build a live bidirectional session pair (Alice initiator, Bob responder).
+fn establish_pair() -> (TripleRatchetSession, TripleRatchetSession) {
+    let alice = UserKeys::generate(1);
+    let bob = UserKeys::generate(2);
+    let bob_bundle = bob.bundle();
+
+    let init = X4DH::initiate(&alice.identity_ed, &alice.identity_dh, &bob_bundle).unwrap();
+    let resp = X4DH::respond(
+        &bob.identity_ed,
+        &bob.identity_dh,
+        &bob.signed_prekey,
+        Some(&bob.one_time_prekey),
+        &bob.pq_sk,
+        &init.identity_dh_public,
+        Some(&alice.identity_ed.public_key()),
+        Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        &init.ephemeral_public,
+        &init.pq_ciphertext,
+    )
+    .unwrap();
+
+    let alice_state = alice_initial_state(&alice, &bob, init.root_key, init.chain_key);
+    let bob_state = bob_initial_state(&bob, &alice, &alice_state.my_dh_public, resp.root_key, resp.chain_key);
+    (
+        TripleRatchetSession::new(alice_state),
+        TripleRatchetSession::new(bob_state),
+    )
+}
+
+/// THE BUG (Jun 27): the server-signed sender cert is issued with a 24h expiry and is
+/// only ever saved at registration — the key-rotation path discards the fresh cert the
+/// server returns, so there is no refresh. Once the cached cert ages out, the recipient
+/// rejects every sealed message (and the poller ACKs + drops it). Messages silently
+/// vanish: exactly "after time passes, sending breaks."
+#[test]
+fn test_expired_sender_cert_is_rejected_on_receive() {
+    let alice = UserKeys::generate(1);
+    let bob = UserKeys::generate(2);
+    let server_pk = test_server_key().public_key().0;
+    let payload = b"ratchet ciphertext goes here";
+
+    // Within the 24h window → accepted.
+    let fresh = sender_cert_with_expiry(&alice, now_secs() + 3600);
+    let env_ok =
+        sealed_sender::seal_message(&bob.identity_dh.public_key(), &fresh, payload).unwrap();
+    assert!(
+        sealed_sender::unseal_message(&bob.identity_dh, &env_ok, &server_pk).is_ok(),
+        "a current sender cert must be accepted"
+    );
+
+    // Expired one minute ago → rejected. This is the time-based send failure.
+    let expired = sender_cert_with_expiry(&alice, now_secs() - 60);
+    let env_bad =
+        sealed_sender::seal_message(&bob.identity_dh.public_key(), &expired, payload).unwrap();
+    assert!(
+        sealed_sender::unseal_message(&bob.identity_dh, &env_bad, &server_pk).is_err(),
+        "an expired sender cert must be rejected on receive (reproduces the bug)"
+    );
+}
+
+/// Long-distance endurance: a high-volume bidirectional conversation (240 messages)
+/// that crosses the 100-message PQ epoch boundary, with out-of-order delivery inside
+/// each burst (network reordering). Every message must decrypt to the right plaintext.
+///
+/// OPEN BUG (Jun 27, bug #3): currently FAILS. When the PQ epoch ratchet fires after the
+/// session has had at least one turn-around, the double-ratchet root asymmetry means the
+/// initiator mixes the PQ secret into a root one KDF-step ahead of the responder, so the
+/// chains desync. Run with `cargo test -- --ignored` to reproduce. See OPUS48 notes.
+#[ignore = "reproduces open epoch-ratchet root-desync bug (#3) — see OPUS48_SESSION_JUN27.md"]
+#[test]
+fn test_long_distance_endurance_with_reordering() {
+    let (mut alice_session, mut bob_session) = establish_pair();
+
+    let turns = 80;
+    let burst = 3;
+    let mut delivered = 0usize;
+
+    for turn in 0..turns {
+        // Encrypt a burst in order from whichever side owns this turn...
+        let mut envs = Vec::new();
+        for i in 0..burst {
+            let label = format!("t{}-m{}", turn, i);
+            let env = if turn % 2 == 0 {
+                alice_session.encrypt(label.as_bytes()).unwrap()
+            } else {
+                bob_session.encrypt(label.as_bytes()).unwrap()
+            };
+            envs.push((label, env));
+        }
+        // ...and deliver out of order (2, 0, 1) to the other side.
+        for &idx in &[2usize, 0, 1] {
+            let (label, env) = &envs[idx];
+            let dec = if turn % 2 == 0 {
+                bob_session.decrypt(env).unwrap()
+            } else {
+                alice_session.decrypt(env).unwrap()
+            };
+            assert_eq!(dec.plaintext, label.as_bytes(), "turn {} idx {}", turn, idx);
+            delivered += 1;
+        }
+    }
+
+    assert_eq!(delivered, turns * burst);
+    // 40 turns each side × 3 = 120 messages per direction, past the 100-message
+    // PQ_RATCHET_INTERVAL, so a count-triggered epoch ratchet must have fired.
+    assert!(
+        alice_session.export_state().epoch_number > 0
+            || bob_session.export_state().epoch_number > 0,
+        "expected at least one PQ epoch ratchet across {} messages",
+        turns * burst
+    );
+}
+
+/// Simulate a full day elapsing between messages: the PQ epoch ratchet fires on the 24h
+/// TIME trigger (not just the message-count trigger). Verifies the time-driven epoch
+/// ratchet pairs with a DH step (M1 invariant) and the message still decrypts — i.e. the
+/// 24h boundary itself does NOT break the ratchet (so the cert is the remaining culprit).
+#[test]
+fn test_epoch_ratchet_first_message_minimal() {
+    // Minimal probe: Alice's VERY FIRST message is the epoch ratchet (no warmup, no
+    // prior DH turn). Isolates the initiator-epoch / responder-receive pairing.
+    let (mut alice_session, mut bob_session) = establish_pair();
+    let mut s = alice_session.export_state().clone();
+    s.epoch_start_time = now_secs() - (PQ_RATCHET_TIME_INTERVAL + 1);
+    let mut alice_session = TripleRatchetSession::new(s);
+
+    let enc = alice_session.encrypt(b"first-and-epoch").unwrap();
+    assert_eq!(enc.header.message_type, MessageType::PqEpochUpdate);
+    let dec = bob_session.decrypt(&enc).unwrap();
+    assert_eq!(dec.plaintext, b"first-and-epoch");
+}
+
+/// Time-triggered epoch ratchet AFTER a normal turn-around.
+/// OPEN BUG (Jun 27, bug #3): FAILS for the same root-desync reason as the endurance
+/// test — the epoch ratchet fires while the roots are asymmetric (Bob has replied once).
+/// Run with `cargo test -- --ignored` to reproduce. See OPUS48_SESSION_JUN27.md.
+#[ignore = "reproduces open epoch-ratchet root-desync bug (#3) — see OPUS48_SESSION_JUN27.md"]
+#[test]
+fn test_epoch_ratchet_after_24h_gap() {
+    let (mut alice_session, mut bob_session) = establish_pair();
+
+    // Warm up with normal exchanges.
+    let e = alice_session.encrypt(b"morning").unwrap();
+    assert_eq!(bob_session.decrypt(&e).unwrap().plaintext, b"morning");
+    let e = bob_session.encrypt(b"morning back").unwrap();
+    assert_eq!(alice_session.decrypt(&e).unwrap().plaintext, b"morning back");
+
+    let epoch_before = alice_session.export_state().epoch_number;
+
+    // Roll Alice's epoch clock back 24h + 1s to simulate a day passing.
+    let mut s = alice_session.export_state().clone();
+    s.epoch_start_time = now_secs() - (PQ_RATCHET_TIME_INTERVAL + 1);
+    let mut alice_session = TripleRatchetSession::new(s);
+
+    // Alice's next send must trigger a time-based PQ epoch ratchet.
+    let enc = alice_session.encrypt(b"next day, still works").unwrap();
+    assert_eq!(
+        enc.header.message_type,
+        MessageType::PqEpochUpdate,
+        "a 24h gap must trigger a PQ epoch ratchet"
+    );
+
+    // Bob decrypts across the epoch + paired DH change (M1 invariant satisfied).
+    let dec = bob_session.decrypt(&enc).unwrap();
+    assert_eq!(dec.plaintext, b"next day, still works");
+    assert!(
+        alice_session.export_state().epoch_number > epoch_before,
+        "epoch number must advance after the time-triggered ratchet"
+    );
+
+    // And the conversation continues normally afterward.
+    let e = bob_session.encrypt(b"glad it works").unwrap();
+    assert_eq!(alice_session.decrypt(&e).unwrap().plaintext, b"glad it works");
 }
