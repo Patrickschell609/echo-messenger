@@ -147,6 +147,7 @@ fn alice_initial_state(
         peer_epoch_pk: Some(bob.pq_pk.clone()),
         epoch_message_count: 0,
         epoch_start_time: now,
+        pending_epoch: None,
         dh_ratchet_number: 0,
         my_dh_public: dh.public_key(),
         my_dh_private: Some(dh.private_key_bytes()),
@@ -195,6 +196,7 @@ fn bob_initial_state(
         peer_epoch_pk: None, // learns Alice's epoch key from her first epoch update
         epoch_message_count: 0,
         epoch_start_time: now,
+        pending_epoch: None,
         dh_ratchet_number: 0,
         my_dh_public: bob.signed_prekey.public_key(),
         my_dh_private: Some(bob.signed_prekey.private_key_bytes()),
@@ -936,4 +938,57 @@ fn test_epoch_ratchet_after_24h_gap() {
     // And the conversation continues normally afterward.
     let e = bob_session.encrypt(b"glad it works").unwrap();
     assert_eq!(alice_session.decrypt(&e).unwrap().plaintext, b"glad it works");
+}
+
+/// One-directional burst of 250 messages crossing the 100-message epoch boundary twice.
+/// Regression for bug B (alternation): the same side must NOT epoch-ratchet twice in a
+/// row against a peer epoch key the peer has already rotated away. The alternation gate
+/// (peer_epoch_pk nulled on use) keeps Alice in epoch 1 until Bob hands her a fresh key,
+/// so all 250 decrypt. Bob stays silent, so Alice keeps advertising the epoch (sticky).
+#[test]
+fn test_one_directional_burst_crosses_epoch() {
+    let (mut alice, mut bob) = establish_pair();
+    for i in 0..250u32 {
+        let label = format!("m{}", i);
+        let env = alice.encrypt(label.as_bytes()).unwrap();
+        let dec = bob
+            .decrypt(&env)
+            .unwrap_or_else(|e| panic!("decrypt failed at msg {}: {:?}", i, e));
+        assert_eq!(dec.plaintext, label.as_bytes());
+    }
+    // Exactly one epoch transition (Bob never sent a fresh key back).
+    assert_eq!(alice.export_state().epoch_number, 1);
+    assert_eq!(bob.export_state().epoch_number, 1);
+}
+
+/// Out-of-order delivery ACROSS an epoch transition: a post-epoch message arrives BEFORE
+/// the message that first triggered the epoch. Regression for bug A (ordering): because
+/// the sender re-stamps the epoch material on every message (sticky), whichever message
+/// arrives first drives the transition, and the earlier one is recovered via skipped keys.
+#[test]
+fn test_epoch_transition_out_of_order() {
+    let (mut alice, mut bob) = establish_pair();
+
+    // Drive Alice to the epoch boundary (100 sends) and capture the first 4 messages of the
+    // new epoch. Bob receives nothing yet.
+    let mut envs = Vec::new();
+    for i in 0..104u32 {
+        let label = format!("m{}", i);
+        let env = alice.encrypt(label.as_bytes()).unwrap();
+        if i >= 100 {
+            envs.push((label, env)); // messages 100..104 (100 = the epoch trigger)
+        }
+    }
+    assert_eq!(alice.export_state().epoch_number, 1, "epoch should have fired at msg 100");
+
+    // Deliver them out of order: 103, 101, 100, 102. Message 103 (post-epoch) arrives first
+    // and must itself drive Bob's transition; 100 (the original trigger) arrives third.
+    for &idx in &[3usize, 1, 0, 2] {
+        let (label, env) = &envs[idx];
+        let dec = bob
+            .decrypt(env)
+            .unwrap_or_else(|e| panic!("decrypt failed for msg {}: {:?}", 100 + idx, e));
+        assert_eq!(dec.plaintext, label.as_bytes(), "msg {}", 100 + idx);
+    }
+    assert_eq!(bob.export_state().epoch_number, 1);
 }

@@ -484,6 +484,7 @@ pub(crate) async fn cmd_recv(
                 peer_epoch_pk: None,
                 epoch_message_count: 0,
                 epoch_start_time: now,
+                pending_epoch: None,
                 dh_ratchet_number: 0,
                 my_dh_public: keys.signed_prekey.public_key(),
                 my_dh_private: Some(keys.signed_prekey.private_key_bytes()),

@@ -562,6 +562,7 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             peer_epoch_pk: None, // learns the initiator's epoch key from their first epoch update
             epoch_message_count: 0,
             epoch_start_time: now,
+            pending_epoch: None,
             dh_ratchet_number: 0,
             my_dh_public: keys.signed_prekey.public_key(),
             my_dh_private: Some(keys.signed_prekey.private_key_bytes()),

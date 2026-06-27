@@ -454,6 +454,7 @@ pub fn build_initiator_state(
         peer_epoch_pk: Some(bundle.pq_prekey.clone()),
         epoch_message_count: 0,
         epoch_start_time: now,
+        pending_epoch: None,
         dh_ratchet_number: 0,
         my_dh_public: dh.public_key(),
         my_dh_private: Some(dh.private_key_bytes()),

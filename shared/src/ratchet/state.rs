@@ -6,6 +6,18 @@ use zeroize::Zeroize;
 
 use crate::types::*;
 
+/// A PQ epoch ratchet that we initiated and are still advertising on every outgoing
+/// message until the peer acknowledges it (by sending a message at our epoch number or
+/// higher). The KEM ciphertext rides on one logical transition, so re-stamping it on each
+/// message makes the epoch self-describing and tolerant of out-of-order delivery — any
+/// message of the new epoch can drive the peer's transition. `ct`/`epoch_pk` are public.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingEpoch {
+    pub ct: PqCiphertext,
+    pub epoch_pk: PqPublicKey,
+    pub epoch_number: u32,
+}
+
 /// Complete Triple Ratchet state for one session endpoint.
 /// Must be stored encrypted (SQLCipher) and zeroized on drop (H3).
 #[derive(Clone, Serialize, Deserialize)]
@@ -18,9 +30,17 @@ pub struct RatchetState {
     pub epoch_number: u32,
     pub my_epoch_pk: Option<PqPublicKey>,
     pub my_epoch_sk: Option<PqSecretKey>,
+    /// The peer's epoch public key we may encapsulate to next. Set to None once consumed
+    /// by an outgoing epoch ratchet — this is the alternation gate: a side may only
+    /// initiate an epoch ratchet while it holds a fresh (unconsumed) peer epoch key, which
+    /// it regains when the peer initiates an epoch ratchet back. Prevents the same side
+    /// from epoch-ratcheting twice in a row against a key the peer has already rotated away.
     pub peer_epoch_pk: Option<PqPublicKey>,
     pub epoch_message_count: u32,
     pub epoch_start_time: u64,
+    /// An epoch ratchet we initiated and are still advertising until the peer acks it.
+    #[serde(default)]
+    pub pending_epoch: Option<PendingEpoch>,
 
     // Layer 2: DH ratchet
     pub dh_ratchet_number: u32,

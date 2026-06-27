@@ -12,7 +12,7 @@ use crate::crypto::kdf;
 use crate::crypto::pq_kem;
 use crate::crypto::x25519::X25519KeyPair;
 use crate::error::{EchoError, Result};
-use crate::ratchet::state::RatchetState;
+use crate::ratchet::state::{PendingEpoch, RatchetState};
 use crate::types::*;
 
 fn now_secs() -> u64 {
@@ -51,26 +51,41 @@ impl TripleRatchetSession {
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<EncryptedMessage> {
         // Decide on the ratchet for this message (Layers 2 + 3).
         //
-        // An epoch ratchet is due when needs_epoch_ratchet() fires AND we hold the peer's
-        // epoch public key. The initiator always has it (from the prekey bundle); the
-        // responder learns it from the initiator's first epoch ratchet. If we don't have
-        // it yet we DEFER (keep sending normally) rather than fail — bidirectional traffic
-        // delivers the peer's epoch key shortly and the ratchet then fires.
-        let epoch_due =
-            self.state.needs_epoch_ratchet() && self.state.peer_epoch_pk.is_some();
+        // An epoch ratchet is due when needs_epoch_ratchet() fires AND we hold a fresh
+        // (unconsumed) peer epoch key AND we aren't still advertising a previous epoch.
+        //   - peer_epoch_pk.is_some() is the ALTERNATION gate (bug B): it is nulled once
+        //     consumed and only refilled when the peer epoch-ratchets back, so the same
+        //     side can't ratchet twice against a key the peer already rotated away.
+        //   - pending_epoch.is_none() avoids stacking a second epoch before the first is
+        //     acknowledged.
+        // If not due, we keep sending normally and (if we initiated an epoch earlier that
+        // the peer hasn't acked yet) re-advertise that epoch's material — see below.
+        let epoch_due = self.state.needs_epoch_ratchet()
+            && self.state.peer_epoch_pk.is_some()
+            && self.state.pending_epoch.is_none();
 
-        let (epoch_ct, new_epoch_pk) = if epoch_due {
+        if epoch_due {
             // Epoch ratchet = a DH ratchet step with the PQ secret folded into the root.
             let (ct, pk) = self.dh_ratchet_send_epoch()?;
-            (Some(ct), Some(pk))
-        } else {
+            // Sticky (bug A): advertise this epoch's material on every message until the
+            // peer acks it, so out-of-order delivery within the transition still resolves.
+            self.state.pending_epoch = Some(PendingEpoch {
+                ct,
+                epoch_pk: pk,
+                epoch_number: self.state.epoch_number, // already advanced in the call above
+            });
+        } else if self.state.sending_chain_key.is_none() {
             // Lazy DH ratchet: only on the first send after a receive cleared the chain.
-            if self.state.sending_chain_key.is_none() {
-                if let Some(ref peer_dh) = self.state.peer_dh_public.clone() {
-                    self.dh_ratchet_send(peer_dh, None)?;
-                }
+            if let Some(ref peer_dh) = self.state.peer_dh_public.clone() {
+                self.dh_ratchet_send(peer_dh, None)?;
             }
-            (None, None)
+        }
+
+        // Stamp the epoch advertisement (the one we are still trying to deliver, if any)
+        // onto this message's header.
+        let (epoch_ct, new_epoch_pk) = match &self.state.pending_epoch {
+            Some(pe) => (Some(pe.ct.clone()), Some(pe.epoch_pk.clone())),
+            None => (None, None),
         };
 
         // Advance symmetric chain (Layer 1)
@@ -164,20 +179,21 @@ impl TripleRatchetSession {
             });
         }
 
-        // Is this an epoch ratchet message (Layer 3)?
-        let epoch = match (&header.epoch_ciphertext, &header.new_epoch_public) {
-            (Some(ct), Some(pk)) => {
-                if header.epoch_number != self.state.epoch_number + 1 {
-                    return Err(EchoError::InvalidMessage(format!(
-                        "unexpected epoch number: got {}, expected {}",
-                        header.epoch_number,
-                        self.state.epoch_number + 1
-                    )));
-                }
-                Some((ct.clone(), pk.clone()))
-            }
-            _ => None,
-        };
+        // Epoch ratchet (Layer 3). The sender re-stamps the same epoch material on every
+        // message of the epoch (sticky), so we act on it only when it advances US by exactly
+        // one epoch. Once we've transitioned, repeated advertisements are ignored and the
+        // message is processed as an ordinary one — making the transition order-independent.
+        let has_epoch_material =
+            header.epoch_ciphertext.is_some() && header.new_epoch_public.is_some();
+        if has_epoch_material && header.epoch_number > self.state.epoch_number + 1 {
+            // A gap: we are missing the epoch(s) in between and cannot transition yet.
+            return Err(EchoError::InvalidMessage(format!(
+                "epoch gap: message at epoch {}, we are at {}",
+                header.epoch_number, self.state.epoch_number
+            )));
+        }
+        let do_epoch_transition =
+            has_epoch_material && header.epoch_number == self.state.epoch_number + 1;
 
         // Does the peer's DH public differ from what we have? (Layer 2 trigger.)
         let need_dh_ratchet = self
@@ -187,9 +203,9 @@ impl TripleRatchetSession {
             .map(|pk| pk != &header.dh_public)
             .unwrap_or(true);
 
-        if let Some((ct, new_pk)) = epoch {
+        if do_epoch_transition {
             // M1 invariant: the sender folds the PQ secret into a DH ratchet step, so an
-            // epoch message MUST carry a changed DH public. Otherwise the PQ secret could
+            // epoch transition MUST carry a changed DH public. Otherwise the PQ secret could
             // not have reached the chain keys — fail-stop rather than desync.
             if !need_dh_ratchet {
                 return Err(EchoError::InvalidMessage(
@@ -201,12 +217,14 @@ impl TripleRatchetSession {
             // Decapsulate the PQ secret and fold it into the DH ratchet's root step, so
             // both sides derive identical chains from a shared root (mirror of
             // dh_ratchet_send_epoch). Requires our epoch secret key to be initialized.
+            let ct = header.epoch_ciphertext.as_ref().unwrap();
+            let new_pk = header.new_epoch_public.as_ref().unwrap().clone();
             let our_sk = self
                 .state
                 .my_epoch_sk
                 .as_ref()
                 .ok_or(EchoError::PqKemError("no local PQ secret key".into()))?;
-            let mut ss = pq_kem::pq_decapsulate(&ct, our_sk)?;
+            let mut ss = pq_kem::pq_decapsulate(ct, our_sk)?;
 
             if header.prev_chain_length > self.state.recv_message_number {
                 self.skip_message_keys(header.prev_chain_length)?;
@@ -214,7 +232,8 @@ impl TripleRatchetSession {
             self.dh_ratchet_receive(&header.dh_public, Some(&ss))?;
             ss.zeroize(); // M4: zeroize PQ shared secret
 
-            // Adopt the peer's new epoch key, rotate ours, advance + reset bookkeeping.
+            // Adopt the peer's fresh epoch key (re-arms our alternation gate), rotate ours,
+            // advance + reset bookkeeping.
             self.state.peer_epoch_pk = Some(new_pk);
             let (np, nsk) = pq_kem::pq_keygen();
             self.state.my_epoch_pk = Some(np);
@@ -223,11 +242,20 @@ impl TripleRatchetSession {
             self.state.epoch_message_count = 0;
             self.state.epoch_start_time = now_secs();
         } else if need_dh_ratchet {
-            // Store remaining skipped keys from the OLD chain before rotating it.
+            // Normal DH ratchet. Also the path for a redundant sticky advertisement we've
+            // already transitioned past: we ignore the stale ct and just ratchet/decrypt.
             if header.prev_chain_length > self.state.recv_message_number {
                 self.skip_message_keys(header.prev_chain_length)?;
             }
             self.dh_ratchet_receive(&header.dh_public, None)?;
+        }
+
+        // Implicit ack: once the peer has reached (or passed) the epoch we are still
+        // advertising, stop re-stamping it on our outgoing messages.
+        if let Some(ref pe) = self.state.pending_epoch {
+            if header.epoch_number >= pe.epoch_number {
+                self.state.pending_epoch = None;
+            }
         }
 
         // Skip ahead if needed
@@ -363,6 +391,10 @@ impl TripleRatchetSession {
         // Combined DH + PQ root step (kdf_root_combined inside dh_ratchet_send).
         self.dh_ratchet_send(&peer_dh, Some(&ss))?;
         ss.zeroize(); // M4: zeroize PQ shared secret
+
+        // Consume the peer's epoch key: we may not epoch-ratchet again until the peer
+        // initiates one back and hands us a fresh key (bug B — the alternation gate).
+        self.state.peer_epoch_pk = None;
 
         // Fresh epoch keypair for the next epoch; advance + reset epoch bookkeeping.
         let (new_pk, new_sk) = pq_kem::pq_keygen();
