@@ -103,11 +103,19 @@ resyncs both sides (mirror the same order on send). Needs careful protocol desig
 NOT ship blind.
 
 ### Status
-- **Bugs #2 and #3 FIXED** (Ghost signed off). Full suite green: 45 unit + 20 integration
-  + 10 transparency = 75 tests, echo-app compiles.
-- **Bug #1 (cert refresh) still open** — needs a client-side cert-refresh path (re-fetch +
-  save the cert the server already returns on key rotation; `poller.rs:980` currently
-  discards it).
+- **Bugs #1, #2, #3 ALL FIXED.** Full suite green: 45 unit + 22 integration + 10
+  transparency = 77 tests; whole workspace compiles.
+
+### Fix for #1 — sender cert refresh (poller.rs)
+New `check_and_refresh_sender_cert()` runs every poll cycle (cheap expiry check; network
+only when needed). If the cached cert is missing or within 6h of its 24h expiry, it
+re-fetches from the server (idempotent re-upload of the CURRENT keys — Ed25519 sigs are
+deterministic so they reproduce; no rotation, no OTP changes), counter-signs (C1), and
+saves the fresh cert to the vault. Wired into both the WS and polling loop branches next to
+`check_and_rotate_keys`. (Rotation runs every 7 days — far too slow for a 24h cert, which
+is why a dedicated expiry-driven refresh was needed.) Not unit-tested (needs a live server,
+like the rest of poller.rs); the crypto-level expiry rejection is covered by
+`test_expired_sender_cert_is_rejected_on_receive`.
 
 ### Fix for #2 — responder epoch keypair (poller.rs)
 `echo-app/src-tauri/src/poller.rs` responder RatchetState now sets
@@ -135,6 +143,41 @@ order. Covered by `test_long_distance_endurance` (in-order, crosses epoch on bot
 This changes the wire/ratchet behavior of the epoch ratchet. Both boxes must run the new
 build together; in-flight sessions established under the old (broken) epoch logic should be
 re-established (they would never have survived an epoch ratchet anyway).
+
+---
+
+## Epoch ratchet robustness (commit `b41db4c`) — found while hardening the out-of-order edge
+
+Looking hard at the epoch path (Ghost: "this is a touchy spot, heart of it") surfaced TWO
+more flaws beyond #3, both reproduced by tests before fixing:
+
+### A) Ordering — KEM ciphertext on a single message
+The epoch KEM ciphertext rode on one message, so a post-epoch message arriving BEFORE the
+epoch trigger couldn't derive the new chain (unlike the 32-byte DH key, which is stamped on
+every message). **Fix (sticky advertisement):** the initiator re-stamps the epoch material
+(`ct` + new epoch pk) on every message until the peer acks it — ack = an incoming
+`epoch_number >= ours`, read off normal traffic (no dedicated handshake, never blocks on an
+offline peer). New `RatchetState.pending_epoch` holds it. Any message of the new epoch can
+now drive the peer's transition; the receiver is idempotent and recovers earlier messages
+via skipped keys. Test: `test_epoch_transition_out_of_order`.
+
+### B) Alternation — same side ratcheting twice in a row
+The same side could epoch-ratchet consecutively (e.g. a one-directional 200-message burst),
+re-encapsulating to a peer epoch key the peer had already rotated away → desync at the 2nd
+boundary. The bidirectional endurance test hid it (epochs alternated naturally). **Fix
+(alternation gate):** `peer_epoch_pk` is nulled once consumed by an outgoing epoch ratchet
+and only refilled when the peer epoch-ratchets back — so a side may only initiate while
+holding a fresh peer key, mirroring how the DH ratchet alternates. Test:
+`test_one_directional_burst_crosses_epoch` (was failing at msg 200).
+
+**Why no other messenger hits this:** classic Double Ratchet has no continuous PQ layer
+(nothing to reorder); Signal's continuous PQ ratchet (SPQR) hits the same wall and chunks +
+reliably reassembles the KEM ciphertext. Our ciphertext fits in one message, so the sticky
+re-stamp is the lightweight equivalent. Known residual: messages within an epoch transition
+must arrive in order relative to *each other* only up to the sticky window — covered.
+
+CLI caveat: `cli/src/main.rs` responder still has `my_epoch=None` (POC test client, same gap
+the old poller had; not the production path).
 
 ---
 

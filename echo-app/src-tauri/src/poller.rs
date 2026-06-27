@@ -5,6 +5,8 @@ use tokio::time;
 
 use base64::Engine as _;
 
+use zeroize::Zeroize;
+
 use echo_client::http::HttpClient;
 use echo_client::identity::SessionMeta;
 use echo_client::wire::WireMessage;
@@ -100,6 +102,7 @@ pub fn start_poller(app: AppHandle) {
                                 // Periodic prekey check, key rotation, outbox drain, group poll, and purge in WS mode
                                 check_and_replenish_prekeys(&app).await;
                                 check_and_rotate_keys(&app).await;
+                                check_and_refresh_sender_cert(&app).await;
                                 drain_outbox(&app).await;
                                 poll_group_messages(&app).await;
                                 purge_expired_messages(&app);
@@ -138,6 +141,7 @@ pub fn start_poller(app: AppHandle) {
                 // Prekey check + key rotation + outbox drain + group poll + purge during polling too
                 check_and_replenish_prekeys(&app).await;
                 check_and_rotate_keys(&app).await;
+                check_and_refresh_sender_cert(&app).await;
                 drain_outbox(&app).await;
                 poll_group_messages(&app).await;
                 purge_expired_messages(&app);
@@ -1018,6 +1022,105 @@ async fn check_and_rotate_keys(app: &AppHandle) {
     }
 
     tracing::info!("key rotation complete: spk_id={}, pq_id={}", new_spk_id, new_pq_id);
+}
+
+/// Bug #1 fix (Jun 27): the server-signed sender certificate expires 24h after it is issued
+/// (server keys.rs sets expiry = now + 86400). It was only ever saved at registration; the
+/// 7-day key rotation re-fetched a fresh cert but discarded it. So after a day the cached
+/// cert was expired, recipients rejected every sealed message (verify_sender_cert), and
+/// messages silently vanished. Refresh proactively whenever the cached cert is missing or
+/// within 6h of expiry by re-fetching from the server and saving the new cert.
+async fn check_and_refresh_sender_cert(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Cheap gate: only hit the network when the cert is missing or near expiry.
+    let needs_refresh = {
+        let vault = state.vault.lock().unwrap();
+        match vault.load_sender_cert::<echo_crypto::sealed_sender::SenderCertificate>() {
+            Some(cert) => cert.expiry <= now + 6 * 60 * 60,
+            None => true,
+        }
+    };
+    if !needs_refresh {
+        return;
+    }
+
+    let identity_state = {
+        let id = state.identity.lock().unwrap();
+        match id.as_ref() {
+            Some(s) => s.clone(),
+            None => return,
+        }
+    };
+
+    let http = {
+        let h = state.http.lock().unwrap();
+        match h.as_ref() {
+            Some(http) => {
+                let mut ed_bytes = [0u8; 32];
+                ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+            }
+            None => return,
+        }
+    };
+
+    // Re-upload the CURRENT keys (no rotation, no OTPs) purely to obtain a fresh cert.
+    // Ed25519 signatures are deterministic, so re-signing reproduces the published sigs.
+    let keys = identity_state.reconstruct_keys();
+    let signed_prekey_sig = keys.identity_ed.sign(&keys.signed_prekey.public_key().0);
+    let pq_pk = echo_crypto::PqPublicKey(identity_state.pq_pk.clone());
+    let pq_prekey_sig = keys.identity_ed.sign(&pq_pk.0);
+
+    let upload_keys = echo_client::identity::KeyMaterial {
+        identity_ed: keys.identity_ed,
+        identity_dh: keys.identity_dh,
+        signed_prekey: keys.signed_prekey,
+        signed_prekey_id: identity_state.signed_prekey_id,
+        signed_prekey_sig,
+        pq_pk,
+        pq_sk: keys.pq_sk,
+        pq_prekey_id: identity_state.pq_prekey_id,
+        pq_prekey_sig,
+        one_time_prekeys: vec![],
+    };
+
+    let cert_bytes = match http
+        .upload_prekeys(identity_state.account_id, &upload_keys, None)
+        .await
+    {
+        Ok((_, Some(cert_bytes), _, _)) => cert_bytes,
+        Ok((_, None, _, _)) => {
+            tracing::warn!("sender cert refresh: server returned no certificate");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("sender cert refresh upload failed: {}", e);
+            return;
+        }
+    };
+
+    // Counter-sign (C1) and save the fresh cert to the vault.
+    match bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
+        Ok(mut cert) => {
+            let mut ed_priv = [0u8; 32];
+            ed_priv.copy_from_slice(&identity_state.identity_ed_private);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+            ed_priv.zeroize();
+            let vault = state.vault.lock().unwrap();
+            if vault.save_sender_cert(&cert).is_err() {
+                tracing::warn!("sender cert refresh: failed to save");
+            } else {
+                tracing::info!("sender cert refreshed (new expiry {})", cert.expiry);
+            }
+        }
+        Err(e) => tracing::warn!("sender cert refresh: deserialize failed: {}", e),
+    }
 }
 
 /// Drain outbox — attempt to send queued messages.
