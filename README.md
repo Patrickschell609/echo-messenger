@@ -44,9 +44,9 @@ Three layers of forward secrecy -- not one:
 |-------|-----------|----------|---------|
 | Symmetric | HKDF-SHA256 chain | Every message | Forward secrecy per message |
 | DH | X25519 Diffie-Hellman | Every turn | Break-in recovery |
-| Post-Quantum | ML-KEM-1024 KEM | Every 100 messages or 24h | Quantum resistance |
+| Post-Quantum | Kyber-1024 KEM | Every 100 messages or 24h | Quantum resistance |
 
-Every major messenger uses a double ratchet. ECHO adds a third layer: periodic ML-KEM-1024 (NIST FIPS 203) key encapsulation that makes harvested ciphertext permanently worthless to quantum computers. This isn't bolted on -- it's woven into the ratchet. After every PQ epoch, a DH ratchet is forced so quantum protection propagates to all subsequent chain keys immediately.
+Every major messenger uses a double ratchet. ECHO adds a third layer: periodic Kyber-1024 (NIST PQC round-3 selection; FIPS 203 ML-KEM migration planned) key encapsulation that makes harvested ciphertext permanently worthless to quantum computers. This isn't bolted on -- it's woven into the ratchet. After every PQ epoch, a DH ratchet is forced so quantum protection propagates to all subsequent chain keys immediately.
 
 ### X4DH Key Agreement
 
@@ -56,7 +56,7 @@ Session establishment extends the X3DH protocol with a post-quantum KEM:
 2. Signed prekey exchange (X25519)
 3. One-time prekey exchange (X25519)
 4. Ephemeral key exchange (X25519)
-5. ML-KEM-1024 encapsulation
+5. Kyber-1024 encapsulation
 
 The result: a shared secret derived from 4 DH operations plus a post-quantum KEM. Both parties' Ed25519 identity keys are bound into the session KDF, preventing unknown key-share attacks. Authentication is cryptographic end-to-end -- not dependent on classical assumptions that quantum computers will break.
 
@@ -182,10 +182,10 @@ All cryptography lives in `shared/` with 67 unit and integration tests. The serv
 |---------|-----------|
 | Identity keys | Ed25519 |
 | Key agreement | X25519 |
-| Post-quantum KEM | ML-KEM-1024 (FIPS 203) |
+| Post-quantum KEM | Kyber-1024 (NIST PQC round 3; FIPS 203 ML-KEM migration planned) |
 | Symmetric encryption | AES-256-GCM |
 | Key derivation | HKDF-SHA256 |
-| Password hashing | Argon2id (256MB/4 iterations) |
+| Password hashing | Argon2id (64MB/3 iterations) |
 | Hash function | SHA-256 |
 | Signatures | Ed25519 (RFC 8032) |
 

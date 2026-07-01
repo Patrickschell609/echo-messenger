@@ -1,4 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -280,11 +279,7 @@ pub async fn upload_prekeys(
     let mut device_bytes = [0u8; 16];
     device_bytes.copy_from_slice(device_id.as_bytes());
 
-    let expiry = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 86400; // 24 hours
+    let expiry = super::unix_now_secs() + 86400; // 24 hours
 
     // Sign: device_id_bytes || identity_key_bytes || expiry_le_bytes
     let mut cert_msg = Vec::new();
@@ -440,10 +435,7 @@ pub async fn get_sth(
 ) -> Result<Json<SthResponse>, ApiError> {
     let leaf_hashes = load_all_leaf_hashes(&state).await?;
     let root = transparency::compute_root(&leaf_hashes);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = super::unix_now_secs();
 
     let mut sth = SignedTreeHead {
         tree_size: leaf_hashes.len() as u64,
@@ -595,10 +587,7 @@ async fn build_transparency_proof(
     }
 
     // Build leaves and compute hashes
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = super::unix_now_secs();
 
     let mut leaves: Vec<TransparencyLeaf> = Vec::with_capacity(rows.len());
     let mut leaf_hashes: Vec<[u8; 32]> = Vec::with_capacity(rows.len());

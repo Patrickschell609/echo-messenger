@@ -105,6 +105,16 @@ const AUTH_TIMESTAMP_TOLERANCE_SECS: u64 = 120;
 ///
 /// Server: lookup device's identity_key from DB, verify signature, check timestamp,
 /// reject seen nonces within the timestamp window.
+/// Current unix time in seconds. Saturates to 0 if the system clock is
+/// before the epoch, so every consumer fails closed (auth rejects, certs
+/// read as expired) instead of panicking mid-request.
+pub fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub async fn authenticate_device(
     headers: &axum::http::HeaderMap,
     method: &str,
@@ -156,10 +166,7 @@ pub async fn authenticate_device(
     }
 
     // Check timestamp freshness
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = unix_now_secs();
 
     let diff = if now > timestamp { now - timestamp } else { timestamp - now };
     if diff > AUTH_TIMESTAMP_TOLERANCE_SECS {

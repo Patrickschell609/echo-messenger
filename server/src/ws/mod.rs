@@ -71,9 +71,9 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
                 authenticated: false,
                 error: Some(e),
             };
-            let _ = socket
-                .send(Message::Text(serde_json::to_string(&resp).unwrap().into()))
-                .await;
+            let payload = serde_json::to_string(&resp)
+                .unwrap_or_else(|_| r#"{"authenticated":false,"error":"internal"}"#.to_string());
+            let _ = socket.send(Message::Text(payload.into())).await;
             return;
         }
     };
@@ -83,11 +83,9 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         authenticated: true,
         error: None,
     };
-    if socket
-        .send(Message::Text(serde_json::to_string(&resp).unwrap().into()))
-        .await
-        .is_err()
-    {
+    let payload = serde_json::to_string(&resp)
+        .unwrap_or_else(|_| r#"{"authenticated":true,"error":null}"#.to_string());
+    if socket.send(Message::Text(payload.into())).await.is_err() {
         return;
     }
 
@@ -221,10 +219,7 @@ async fn authenticate_ws(socket: &mut WebSocket, state: &AppState) -> Result<Uui
     }
 
     // Check timestamp freshness
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = crate::api::unix_now_secs();
 
     let diff = if now > timestamp {
         now - timestamp

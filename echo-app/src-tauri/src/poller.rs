@@ -696,6 +696,34 @@ fn decode_media_payload(
             .replace("..", "_");
         let safe_name = safe_name.trim_matches(|c: char| c == '.' || c == ' ' || c == '_').to_string();
         let safe_name = if safe_name.is_empty() { "file".to_string() } else { safe_name };
+
+        // MIME allowlist with canonical extensions. The on-disk extension is
+        // forced to match the claimed MIME type so a spoofed filename (e.g.
+        // "invoice.exe" claiming image/png) can never land on disk with an
+        // executable extension. Unknown MIME types are quarantined as .bin.
+        const ALLOWED_MIME_TYPES: &[(&str, &[&str])] = &[
+            ("image/png", &["png"]),
+            ("image/jpeg", &["jpg", "jpeg"]),
+            ("image/gif", &["gif"]),
+            ("image/webp", &["webp"]),
+            ("audio/mpeg", &["mp3"]),
+            ("audio/ogg", &["ogg"]),
+            ("audio/wav", &["wav"]),
+            ("video/mp4", &["mp4"]),
+            ("video/webm", &["webm"]),
+            ("application/pdf", &["pdf"]),
+        ];
+        let allowed = ALLOWED_MIME_TYPES
+            .iter()
+            .find(|(m, _)| *m == media.mime_type.as_str());
+        let current_ext = safe_name.rsplit('.').next().map(|e| e.to_ascii_lowercase());
+        let safe_name = match allowed {
+            Some((_, exts)) if current_ext.as_deref().is_some_and(|e| exts.contains(&e)) => {
+                safe_name
+            }
+            Some((_, exts)) => format!("{}.{}", safe_name, exts[0]),
+            None => format!("{}.bin", safe_name),
+        };
         let local_path = peer_dir.join(format!("{}_{}", timestamp, safe_name));
         std::fs::write(&local_path, &media.data).ok();
 
@@ -704,13 +732,7 @@ fn decode_media_payload(
 
         // Build data URL for immediate display
         let b64 = base64::engine::general_purpose::STANDARD.encode(&media.data);
-        const ALLOWED_MIME_TYPES: &[&str] = &[
-            "image/png", "image/jpeg", "image/gif", "image/webp",
-            "audio/mpeg", "audio/ogg", "audio/wav",
-            "video/mp4", "video/webm",
-            "application/pdf",
-        ];
-        let safe_mime = if ALLOWED_MIME_TYPES.contains(&media.mime_type.as_str()) {
+        let safe_mime = if allowed.is_some() {
             media.mime_type.clone()
         } else {
             "application/octet-stream".to_string()
@@ -721,7 +743,7 @@ fn decode_media_payload(
             history_text,
             media.filename.clone(),
             Some(data_url),
-            Some(media.mime_type),
+            Some(safe_mime),
             Some(media.filename),
         )
     } else {

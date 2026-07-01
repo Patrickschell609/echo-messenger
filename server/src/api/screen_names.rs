@@ -33,13 +33,13 @@ fn validate_screen_name(name: &str, min_len: usize) -> Result<(), ApiError> {
 
     let chars: Vec<char> = name.chars().collect();
 
-    // Must start with a letter
-    if !chars[0].is_ascii_alphabetic() {
+    // Must start with a letter (first() guards empty input if min_len is ever 0)
+    if !chars.first().is_some_and(|c| c.is_ascii_alphabetic()) {
         return Err(ApiError::BadRequest("Screen name must start with a letter".into()));
     }
 
     // Must end with alphanumeric
-    if !chars.last().unwrap().is_ascii_alphanumeric() {
+    if !chars.last().is_some_and(|c| c.is_ascii_alphanumeric()) {
         return Err(ApiError::BadRequest("Screen name must end with a letter or number".into()));
     }
 
