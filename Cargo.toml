@@ -24,8 +24,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
-pqcrypto-kyber = "0.8"
-pqcrypto-traits = "0.3"
+fips203 = "0.4"  # FIPS 203 ML-KEM (final standard, replaces round-3 pqcrypto-kyber)
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

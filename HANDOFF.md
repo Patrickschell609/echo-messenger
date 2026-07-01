@@ -392,12 +392,12 @@ convert: ^3.1.0                # Hex encoding
 1. **Install Flutter SDK** and run `flutter create .` inside `client/` to generate platform scaffolding (AndroidManifest, Gradle, etc.)
 2. **Run flutter_rust_bridge codegen:** `flutter_rust_bridge_codegen generate` pointing at `shared/src/ffi_api.rs`
 3. **Replace `throw UnimplementedError`** in `CryptoService` methods with actual generated FFI calls (they currently define the interface but need the codegen output)
-4. **Test pqcrypto-kyber cross-compilation** — ML-KEM-1024 uses PQClean C code. Android NDK may need explicit `CC`/`AR` in `.cargo/config.toml`. If it fails, fall back to vendoring PQClean with CMake.
+4. ~~**Test pqcrypto-kyber cross-compilation**~~ **RESOLVED Jul 1 2026:** migrated to the pure-Rust `fips203` crate (FIPS 203 ML-KEM-1024). No C code, no PQClean, no NDK toolchain concerns.
 5. **Wire up identity context** — `SessionService` and `MessageService` have placeholder bytes for our own identity/device ID in wire messages. These need to be injected from the identity provider at call sites.
 
-### Risk: pqcrypto-kyber cross-compilation
+### Risk: pqcrypto-kyber cross-compilation — RESOLVED
 
-ML-KEM-1024 uses PQClean C code. Android NDK provides the C toolchain but may need explicit `CC`/`AR` in `.cargo/config.toml`. Test this before writing more Dart code. If it fails, fall back to vendoring PQClean with CMake or using a pure-Rust PQ implementation.
+**Jul 1 2026:** ML-KEM is now the pure-Rust `fips203` crate (FIPS 203 final standard). The PQClean C cross-compilation risk no longer exists.
 
 ---
 
