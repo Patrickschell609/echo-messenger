@@ -83,13 +83,17 @@ impl UserKeys {
 
         PrekeyBundle {
             identity_key: self.identity_ed.public_key(),
+            ml_dsa_identity_key: Vec::new(),
             identity_dh_key: self.identity_dh.public_key(),
             identity_dh_key_signature: dh_key_sig,
+            identity_dh_key_ml_dsa_signature: Vec::new(),
             signed_prekey: self.signed_prekey.public_key(),
             signed_prekey_signature: spk_sig,
+            signed_prekey_ml_dsa_signature: Vec::new(),
             signed_prekey_id: self.signed_prekey_id,
             pq_prekey: self.pq_pk.clone(),
             pq_prekey_signature: pq_sig,
+            pq_prekey_ml_dsa_signature: Vec::new(),
             pq_prekey_id: self.pq_prekey_id,
             one_time_prekey: Some(self.one_time_prekey.public_key()),
             one_time_prekey_id: Some(self.one_time_prekey_id),

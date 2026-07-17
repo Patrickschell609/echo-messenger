@@ -321,6 +321,10 @@ impl HttpClient {
             pq_prekey: Option<String>,
             pq_prekey_sig: Option<String>,
             pq_prekey_id: Option<i32>,
+            ml_dsa_identity_key: Option<String>,
+            identity_dh_key_ml_dsa_sig: Option<String>,
+            signed_prekey_ml_dsa_sig: Option<String>,
+            pq_prekey_ml_dsa_sig: Option<String>,
             one_time_prekeys: Vec<OtpkReq>,
             auth_nonce: Option<String>,
             auth_signature: Option<String>,
@@ -362,6 +366,21 @@ impl HttpClient {
         let dh_sig = signing_key.sign(&dh_bind_msg);
         let identity_dh_key_sig = hex::encode(dh_sig.to_bytes());
 
+        // PQ (ML-DSA-87) hybrid halves, over the SAME messages as the Ed25519 sigs above.
+        // Empty for legacy identities without an ML-DSA key (should not occur post-migration).
+        let (ml_dsa_identity_key, identity_dh_key_ml_dsa_sig, signed_prekey_ml_dsa_sig, pq_prekey_ml_dsa_sig) =
+            if !keys.identity_mldsa_sk.is_empty() {
+                use echo_crypto::crypto::pq_sign::pq_sign;
+                (
+                    Some(hex::encode(&keys.identity_mldsa_pk)),
+                    Some(hex::encode(pq_sign(&keys.identity_mldsa_sk, &dh_bind_msg)?)),
+                    Some(hex::encode(pq_sign(&keys.identity_mldsa_sk, &keys.signed_prekey.public_key().0)?)),
+                    Some(hex::encode(pq_sign(&keys.identity_mldsa_sk, &keys.pq_pk.0)?)),
+                )
+            } else {
+                (None, None, None, None)
+            };
+
         let req = Req {
             account_id,
             identity_key: hex::encode(&identity_key_bytes),
@@ -373,6 +392,10 @@ impl HttpClient {
             pq_prekey: Some(hex::encode(&keys.pq_pk.0)),
             pq_prekey_sig: Some(hex::encode(&keys.pq_prekey_sig)),
             pq_prekey_id: Some(keys.pq_prekey_id as i32),
+            ml_dsa_identity_key,
+            identity_dh_key_ml_dsa_sig,
+            signed_prekey_ml_dsa_sig,
+            pq_prekey_ml_dsa_sig,
             one_time_prekeys: otpks,
             auth_nonce: auth_nonce.map(|s| s.to_string()),
             auth_signature: Some(auth_signature),

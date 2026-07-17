@@ -34,6 +34,18 @@ pub struct UploadPrekeysRequest {
     /// Ed25519 signature of PQ prekey (hex)
     pub pq_prekey_sig: Option<String>,
     pub pq_prekey_id: Option<i32>,
+    /// ML-DSA-87 identity public key (hex) — post-quantum half of the hybrid identity.
+    #[serde(default)]
+    pub ml_dsa_identity_key: Option<String>,
+    /// ML-DSA-87 signature over the DH-binding message (hex).
+    #[serde(default)]
+    pub identity_dh_key_ml_dsa_sig: Option<String>,
+    /// ML-DSA-87 signature over the signed prekey (hex).
+    #[serde(default)]
+    pub signed_prekey_ml_dsa_sig: Option<String>,
+    /// ML-DSA-87 signature over the PQ prekey (hex).
+    #[serde(default)]
+    pub pq_prekey_ml_dsa_sig: Option<String>,
     /// One-time prekeys: list of (key_id, public_key_hex)
     pub one_time_prekeys: Vec<OneTimePrekey>,
     /// Auth nonce from registration (hex, required for new devices)
@@ -165,11 +177,21 @@ pub async fn upload_prekeys(
         .transpose()
         .map_err(|_| ApiError::BadRequest("invalid identity_dh_key_sig hex".into()))?;
 
+    // PQ (ML-DSA-87) hybrid signature material.
+    let decode_pq = |h: &Option<String>, what: &str| -> Result<Option<Vec<u8>>, ApiError> {
+        h.as_ref().map(|s| hex::decode(s)).transpose()
+            .map_err(|_| ApiError::BadRequest(format!("invalid {} hex", what)))
+    };
+    let ml_dsa_identity_key = decode_pq(&req.ml_dsa_identity_key, "ml_dsa_identity_key")?;
+    let identity_dh_key_ml_dsa_sig = decode_pq(&req.identity_dh_key_ml_dsa_sig, "identity_dh_key_ml_dsa_sig")?;
+    let signed_prekey_ml_dsa_sig = decode_pq(&req.signed_prekey_ml_dsa_sig, "signed_prekey_ml_dsa_sig")?;
+    let pq_prekey_ml_dsa_sig = decode_pq(&req.pq_prekey_ml_dsa_sig, "pq_prekey_ml_dsa_sig")?;
+
     // Upsert device (insert or update on conflict)
     let (device_id,): (Uuid,) = sqlx::query_as(
         r#"
-        INSERT INTO devices (account_id, identity_key, identity_dh_key, identity_dh_key_sig, signed_prekey, signed_prekey_sig, signed_prekey_id, pq_prekey, pq_prekey_sig, pq_prekey_id, last_seen)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        INSERT INTO devices (account_id, identity_key, identity_dh_key, identity_dh_key_sig, signed_prekey, signed_prekey_sig, signed_prekey_id, pq_prekey, pq_prekey_sig, pq_prekey_id, ml_dsa_identity_key, identity_dh_key_ml_dsa_sig, signed_prekey_ml_dsa_sig, pq_prekey_ml_dsa_sig, last_seen)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
         ON CONFLICT (account_id, identity_key) DO UPDATE SET
             identity_dh_key = EXCLUDED.identity_dh_key,
             identity_dh_key_sig = EXCLUDED.identity_dh_key_sig,
@@ -179,6 +201,10 @@ pub async fn upload_prekeys(
             pq_prekey = EXCLUDED.pq_prekey,
             pq_prekey_sig = EXCLUDED.pq_prekey_sig,
             pq_prekey_id = EXCLUDED.pq_prekey_id,
+            ml_dsa_identity_key = EXCLUDED.ml_dsa_identity_key,
+            identity_dh_key_ml_dsa_sig = EXCLUDED.identity_dh_key_ml_dsa_sig,
+            signed_prekey_ml_dsa_sig = EXCLUDED.signed_prekey_ml_dsa_sig,
+            pq_prekey_ml_dsa_sig = EXCLUDED.pq_prekey_ml_dsa_sig,
             last_seen = NOW()
         RETURNING id
         "#
@@ -193,6 +219,10 @@ pub async fn upload_prekeys(
     .bind(&pq_prekey)
     .bind(&pq_prekey_sig)
     .bind(req.pq_prekey_id)
+    .bind(&ml_dsa_identity_key)
+    .bind(&identity_dh_key_ml_dsa_sig)
+    .bind(&signed_prekey_ml_dsa_sig)
+    .bind(&pq_prekey_ml_dsa_sig)
     .fetch_one(&state.db)
     .await?;
 
@@ -327,6 +357,14 @@ pub struct FetchPrekeysResponse {
     pub pq_prekey: Option<String>,
     pub pq_prekey_sig: Option<String>,
     pub pq_prekey_id: Option<i32>,
+    /// ML-DSA-87 identity public key (hex) — post-quantum half of the hybrid identity.
+    pub ml_dsa_identity_key: Option<String>,
+    /// ML-DSA-87 signature over the DH-binding message (hex).
+    pub identity_dh_key_ml_dsa_sig: Option<String>,
+    /// ML-DSA-87 signature over the signed prekey (hex).
+    pub signed_prekey_ml_dsa_sig: Option<String>,
+    /// ML-DSA-87 signature over the PQ prekey (hex).
+    pub pq_prekey_ml_dsa_sig: Option<String>,
     pub one_time_prekey: Option<String>,
     pub one_time_prekey_id: Option<i32>,
     /// Key transparency proof bundle (null if transparency log is empty)
@@ -349,12 +387,14 @@ pub async fn fetch_prekeys(
         .and_then(|s| s.parse().ok());
 
     // Fetch device keys
-    let row: (Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Vec<u8>, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<i32>) =
+    let row: (Vec<u8>, Vec<u8>, Option<Vec<u8>>, Vec<u8>, Vec<u8>, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<i32>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>) =
         sqlx::query_as(
             r#"
             SELECT identity_key, identity_dh_key, identity_dh_key_sig,
                    signed_prekey, signed_prekey_sig, signed_prekey_id,
-                   pq_prekey, pq_prekey_sig, pq_prekey_id
+                   pq_prekey, pq_prekey_sig, pq_prekey_id,
+                   ml_dsa_identity_key, identity_dh_key_ml_dsa_sig,
+                   signed_prekey_ml_dsa_sig, pq_prekey_ml_dsa_sig
             FROM devices WHERE id = $1
             "#
         )
@@ -416,6 +456,10 @@ pub async fn fetch_prekeys(
         pq_prekey: row.6.as_ref().map(hex::encode),
         pq_prekey_sig: row.7.as_ref().map(hex::encode),
         pq_prekey_id: row.8,
+        ml_dsa_identity_key: row.9.as_ref().map(hex::encode),
+        identity_dh_key_ml_dsa_sig: row.10.as_ref().map(hex::encode),
+        signed_prekey_ml_dsa_sig: row.11.as_ref().map(hex::encode),
+        pq_prekey_ml_dsa_sig: row.12.as_ref().map(hex::encode),
         one_time_prekey: otpk.as_ref().map(|(_, pk)| hex::encode(pk)),
         one_time_prekey_id: otpk.as_ref().map(|(id, _)| *id),
         transparency,
