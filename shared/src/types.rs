@@ -72,16 +72,29 @@ pub struct DeviceId(pub [u8; 16]);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrekeyBundle {
     pub identity_key: IdentityPublicKey,
+    /// ML-DSA-87 identity public key — post-quantum half of the hybrid identity.
+    /// Empty for legacy bundles created before PQ signatures.
+    #[serde(default)]
+    pub ml_dsa_identity_key: Vec<u8>,
     pub identity_dh_key: PublicKey,              // X25519 identity key for DH operations
     /// Ed25519 signature binding identity_dh_key to identity_key (C3).
     /// sign("echo-dh-binding:" || identity_dh_key_bytes)
     #[serde(default)]
     pub identity_dh_key_signature: Vec<u8>,
+    /// ML-DSA-87 signature over the same DH-binding message (post-quantum half).
+    #[serde(default)]
+    pub identity_dh_key_ml_dsa_signature: Vec<u8>,
     pub signed_prekey: PublicKey,
     pub signed_prekey_signature: Vec<u8>,
+    /// ML-DSA-87 signature over the signed prekey (post-quantum half).
+    #[serde(default)]
+    pub signed_prekey_ml_dsa_signature: Vec<u8>,
     pub signed_prekey_id: u32,
     pub pq_prekey: PqPublicKey,
     pub pq_prekey_signature: Vec<u8>,
+    /// ML-DSA-87 signature over the PQ prekey (post-quantum half).
+    #[serde(default)]
+    pub pq_prekey_ml_dsa_signature: Vec<u8>,
     pub pq_prekey_id: u32,
     pub one_time_prekey: Option<PublicKey>,
     pub one_time_prekey_id: Option<u32>,

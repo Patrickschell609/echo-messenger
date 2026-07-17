@@ -701,15 +701,27 @@ impl HttpClient {
 #[derive(Deserialize)]
 pub struct PrekeyBundleResponse {
     pub identity_key: String,
+    /// ML-DSA-87 identity public key (hex) — post-quantum half of the hybrid identity.
+    #[serde(default)]
+    pub ml_dsa_identity_key: Option<String>,
     pub identity_dh_key: String,
     /// C3: Ed25519 signature binding identity_dh_key to identity_key (hex)
     #[serde(default)]
     pub identity_dh_key_sig: Option<String>,
+    /// ML-DSA-87 signature over the DH-binding message (hex).
+    #[serde(default)]
+    pub identity_dh_key_ml_dsa_sig: Option<String>,
     pub signed_prekey: String,
     pub signed_prekey_sig: String,
+    /// ML-DSA-87 signature over the signed prekey (hex).
+    #[serde(default)]
+    pub signed_prekey_ml_dsa_sig: Option<String>,
     pub signed_prekey_id: i32,
     pub pq_prekey: Option<String>,
     pub pq_prekey_sig: Option<String>,
+    /// ML-DSA-87 signature over the PQ prekey (hex).
+    #[serde(default)]
+    pub pq_prekey_ml_dsa_sig: Option<String>,
     pub pq_prekey_id: Option<i32>,
     pub one_time_prekey: Option<String>,
     pub one_time_prekey_id: Option<i32>,
@@ -759,15 +771,28 @@ impl PrekeyBundleResponse {
             .transpose()?
             .unwrap_or_default();
 
+        // Post-quantum halves (empty for legacy bundles).
+        let decode_opt = |h: &Option<String>| -> Result<Vec<u8>> {
+            Ok(h.as_ref().map(|s| hex::decode(s)).transpose()?.unwrap_or_default())
+        };
+        let ml_dsa_identity_key = decode_opt(&self.ml_dsa_identity_key)?;
+        let identity_dh_key_ml_dsa_signature = decode_opt(&self.identity_dh_key_ml_dsa_sig)?;
+        let signed_prekey_ml_dsa_signature = decode_opt(&self.signed_prekey_ml_dsa_sig)?;
+        let pq_prekey_ml_dsa_signature = decode_opt(&self.pq_prekey_ml_dsa_sig)?;
+
         Ok(echo_crypto::PrekeyBundle {
             identity_key: echo_crypto::IdentityPublicKey(ik),
+            ml_dsa_identity_key,
             identity_dh_key: echo_crypto::PublicKey(idk),
             identity_dh_key_signature: identity_dh_key_sig,
+            identity_dh_key_ml_dsa_signature,
             signed_prekey: echo_crypto::PublicKey(spk),
             signed_prekey_signature: signed_prekey_sig,
+            signed_prekey_ml_dsa_signature,
             signed_prekey_id: self.signed_prekey_id as u32,
             pq_prekey: echo_crypto::PqPublicKey(pq_prekey_bytes),
             pq_prekey_signature: pq_prekey_sig,
+            pq_prekey_ml_dsa_signature,
             pq_prekey_id: self.pq_prekey_id.unwrap_or(1) as u32,
             one_time_prekey: otpk,
             one_time_prekey_id: self.one_time_prekey_id.map(|id| id as u32),
