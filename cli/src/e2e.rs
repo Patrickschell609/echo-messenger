@@ -185,9 +185,20 @@ async fn register_identity(
 ) -> Result<(uuid::Uuid, Option<String>)> {
     let (account_id, auth_nonce) = http.redeem_invite(invite).await?;
     let keys = identity::KeyMaterial::generate();
-    let (device_id, _cert, short_code, _screen_name) = http
+    let (device_id, cert, short_code, _screen_name) = http
         .upload_prekeys(account_id, &keys, Some(&auth_nonce))
         .await?;
     store.save(account_id, device_id, &keys)?;
+
+    // Capture + counter-sign the real server-signed sender cert (H1/C1), same as cmd_register.
+    if let Some(cert_bytes) = cert {
+        let state = store.load()?;
+        if let Ok(mut sc) = bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
+            let mut ed_priv = [0u8; 32];
+            ed_priv.copy_from_slice(&state.identity_ed_private);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut sc, &ed_priv);
+            store.save_sender_cert(&sc)?;
+        }
+    }
     Ok((device_id, short_code))
 }

@@ -121,10 +121,24 @@ async fn cmd_register(http: &HttpClient, store: &IdentityStore, invite: &str) ->
     let keys = identity::KeyMaterial::generate();
 
     println!("Uploading prekey bundle...");
-    let (device_id, _sender_cert, _short_code, _screen_name) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await?;
+    let (device_id, sender_cert, _short_code, _screen_name) = http.upload_prekeys(account_id, &keys, Some(&auth_nonce)).await?;
     println!("Device: {}", device_id);
 
     store.save(account_id, device_id, &keys)?;
+
+    // Capture the real server-signed sender certificate (H1/C1): counter-sign it with our
+    // Ed25519 identity key and store it, instead of relying on the legacy self-signed
+    // placeholder cert (which carries a zeroed server signature and is rejected by the
+    // now-mandatory server-signature check). Mirrors the GUI's auth.rs.
+    if let Some(cert_bytes) = sender_cert {
+        let state = store.load()?;
+        if let Ok(mut cert) = bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
+            let mut ed_priv = [0u8; 32];
+            ed_priv.copy_from_slice(&state.identity_ed_private);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+            store.save_sender_cert(&cert)?;
+        }
+    }
     println!("Identity saved to {}", store.path().display());
     println!("\nReady. Your device ID is: {}", device_id);
 
@@ -284,7 +298,10 @@ pub(crate) async fn cmd_send(
 
     let wire_payload = bincode::serialize(&wire_msg)?;
 
-    let cert = identity::build_sender_cert(&state);
+    // Prefer the real server-signed + counter-signed cert saved at registration (H1/C1);
+    // fall back to the legacy self-signed cert only for identities created before this fix.
+    let cert = store.load_sender_cert()
+        .unwrap_or_else(|| identity::build_sender_cert(&state));
     let envelope = echo_crypto::sealed_sender::seal_message(
         &session_meta.recipient_dh_key,
         &cert,
@@ -343,8 +360,23 @@ pub(crate) async fn cmd_recv(
                 arr
             }
             None => {
-                eprintln!("  [msg {}] no server transparency key — cannot verify cert", qm.id);
-                continue;
+                // Auto-fetch + cache the server transparency key if we've never
+                // initiated a session (mirrors the GUI poller's Bug-2 fix). Without
+                // this, a receiver that only registered + recv'd has no key and skips
+                // every incoming message, so it can never establish a reply session.
+                match http.fetch_sth().await {
+                    Ok(sth_resp) => {
+                        store.save_server_transparency_key(&sth_resp.server_public_key).ok();
+                        let bytes = hex::decode(&sth_resp.server_public_key)?;
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        arr
+                    }
+                    Err(e) => {
+                        eprintln!("  [msg {}] no server transparency key and fetch failed: {}", qm.id, e);
+                        continue;
+                    }
+                }
             }
         };
 
