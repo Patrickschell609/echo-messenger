@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use echo_crypto::crypto::ed25519::Ed25519KeyPair;
 use echo_crypto::crypto::kdf;
 use echo_crypto::crypto::pq_kem;
+use echo_crypto::crypto::pq_sign;
 use echo_crypto::crypto::x25519::X25519KeyPair;
 use echo_crypto::ratchet::session::TripleRatchetSession;
 use echo_crypto::ratchet::state::RatchetState;
@@ -34,6 +35,8 @@ fn test_server_key() -> Ed25519KeyPair {
 /// Helper: generate a full prekey bundle for a user.
 struct UserKeys {
     identity_ed: Ed25519KeyPair,
+    identity_mldsa_pk: Vec<u8>,
+    identity_mldsa_sk: Vec<u8>,
     identity_dh: X25519KeyPair,
     signed_prekey: X25519KeyPair,
     signed_prekey_id: u32,
@@ -48,6 +51,7 @@ struct UserKeys {
 impl UserKeys {
     fn generate(device_seed: u8) -> Self {
         let identity_ed = Ed25519KeyPair::generate();
+        let (identity_mldsa_pk, identity_mldsa_sk) = pq_sign::pq_sign_keygen();
         let identity_dh = X25519KeyPair::generate();
         let signed_prekey = X25519KeyPair::generate();
         let one_time_prekey = X25519KeyPair::generate();
@@ -58,6 +62,8 @@ impl UserKeys {
 
         Self {
             identity_ed,
+            identity_mldsa_pk,
+            identity_mldsa_sk,
             identity_dh,
             signed_prekey,
             signed_prekey_id: 1,
@@ -81,19 +87,24 @@ impl UserKeys {
         dh_bind_msg.extend_from_slice(&self.identity_dh.public_key().0);
         let dh_key_sig = self.identity_ed.sign(&dh_bind_msg);
 
+        // Post-quantum (ML-DSA-87) halves over the same messages.
+        let spk_ml = pq_sign::pq_sign(&self.identity_mldsa_sk, &self.signed_prekey.public_key().0).unwrap();
+        let pq_ml = pq_sign::pq_sign(&self.identity_mldsa_sk, &self.pq_pk.0).unwrap();
+        let dh_key_ml = pq_sign::pq_sign(&self.identity_mldsa_sk, &dh_bind_msg).unwrap();
+
         PrekeyBundle {
             identity_key: self.identity_ed.public_key(),
-            ml_dsa_identity_key: Vec::new(),
+            ml_dsa_identity_key: self.identity_mldsa_pk.clone(),
             identity_dh_key: self.identity_dh.public_key(),
             identity_dh_key_signature: dh_key_sig,
-            identity_dh_key_ml_dsa_signature: Vec::new(),
+            identity_dh_key_ml_dsa_signature: dh_key_ml,
             signed_prekey: self.signed_prekey.public_key(),
             signed_prekey_signature: spk_sig,
-            signed_prekey_ml_dsa_signature: Vec::new(),
+            signed_prekey_ml_dsa_signature: spk_ml,
             signed_prekey_id: self.signed_prekey_id,
             pq_prekey: self.pq_pk.clone(),
             pq_prekey_signature: pq_sig,
-            pq_prekey_ml_dsa_signature: Vec::new(),
+            pq_prekey_ml_dsa_signature: pq_ml,
             pq_prekey_id: self.pq_prekey_id,
             one_time_prekey: Some(self.one_time_prekey.public_key()),
             one_time_prekey_id: Some(self.one_time_prekey_id),

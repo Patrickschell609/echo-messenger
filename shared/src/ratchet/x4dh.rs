@@ -9,6 +9,7 @@
 //!
 //! SK = HKDF(DH1 || DH2 || DH3 || DH4 || PQ_SS, "TR3_SESSION_v1")
 
+use crate::crypto::hybrid_sig;
 use crate::crypto::kdf;
 use crate::crypto::pq_kem;
 use crate::crypto::x25519::X25519KeyPair;
@@ -41,38 +42,51 @@ impl X4DH {
         our_identity_dh: &X25519KeyPair,
         their_bundle: &PrekeyBundle,
     ) -> Result<X4DHInitResult> {
-        // C3: Verify Bob's identity_dh_key is bound to his Ed25519 identity.
-        // H2 (Apr 21 audit): the binding check is MANDATORY. An empty signature
-        // must not silently skip it — otherwise a compromised server could strip
-        // the signature from the prekey bundle and defeat the C3 identity binding,
-        // enabling an unknown-key-share attack.
-        if their_bundle.identity_dh_key_signature.is_empty() {
+        // C3 + PQ: Verify Bob's identity_dh_key, signed prekey, and PQ prekey are
+        // bound to his HYBRID identity (Ed25519 + ML-DSA-87) — the initiator requires
+        // BOTH halves on every binding. H2 (Apr 21 audit): the checks are MANDATORY;
+        // a missing half must not silently downgrade to classical-only, else a
+        // compromised server could strip the PQ (or C3) signature and defeat the
+        // binding, enabling an unknown-key-share attack.
+        if their_bundle.identity_dh_key_signature.is_empty()
+            || their_bundle.ml_dsa_identity_key.is_empty()
+            || their_bundle.identity_dh_key_ml_dsa_signature.is_empty()
+        {
             return Err(EchoError::InvalidMessage(
-                "prekey bundle missing identity_dh_key binding signature (C3)".into(),
+                "prekey bundle missing hybrid identity/DH-binding signature".into(),
             ));
         }
+        let verify_binding = |msg: &[u8], ed_sig: &[u8], ml_dsa_sig: &[u8]| -> Result<()> {
+            hybrid_sig::hybrid_verify(
+                &their_bundle.identity_key.0,
+                &their_bundle.ml_dsa_identity_key,
+                msg,
+                &hybrid_sig::HybridSignature {
+                    ed25519: ed_sig.to_vec(),
+                    ml_dsa: ml_dsa_sig.to_vec(),
+                },
+            )
+        };
+
         let mut dh_bind_msg = Vec::new();
         dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
         dh_bind_msg.extend_from_slice(&their_bundle.identity_dh_key.0);
-        Ed25519KeyPair::verify(
-            &their_bundle.identity_key,
+        verify_binding(
             &dh_bind_msg,
             &their_bundle.identity_dh_key_signature,
+            &their_bundle.identity_dh_key_ml_dsa_signature,
         )?;
 
-        // Verify Bob's signed prekey signature
-        let spk_bytes = &their_bundle.signed_prekey.0;
-        Ed25519KeyPair::verify(
-            &their_bundle.identity_key,
-            spk_bytes,
+        verify_binding(
+            &their_bundle.signed_prekey.0,
             &their_bundle.signed_prekey_signature,
+            &their_bundle.signed_prekey_ml_dsa_signature,
         )?;
 
-        // Verify Bob's PQ prekey signature
-        Ed25519KeyPair::verify(
-            &their_bundle.identity_key,
+        verify_binding(
             &their_bundle.pq_prekey.0,
             &their_bundle.pq_prekey_signature,
+            &their_bundle.pq_prekey_ml_dsa_signature,
         )?;
 
         // Generate ephemeral X25519 key
