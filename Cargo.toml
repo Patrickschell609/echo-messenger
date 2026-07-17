@@ -25,6 +25,7 @@ sha2 = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 fips203 = "0.4"  # FIPS 203 ML-KEM (final standard, replaces round-3 pqcrypto-kyber)
+fips204 = "0.4"  # FIPS 204 ML-DSA (post-quantum signatures, hybrid with Ed25519)
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

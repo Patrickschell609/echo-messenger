@@ -29,6 +29,9 @@ pub enum EchoError {
     #[error("PQ KEM error: {0}")]
     PqKemError(String),
 
+    #[error("PQ signature error: {0}")]
+    PqSignError(String),
+
     #[error("Sealed sender verification failed")]
     SealedSenderFailed,
 

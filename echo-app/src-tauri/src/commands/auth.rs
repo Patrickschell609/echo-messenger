@@ -65,6 +65,8 @@ pub async fn create_account(
         device_id,
         identity_ed_private: keys.identity_ed.private_key_bytes().0.to_vec(),
         identity_ed_public: keys.identity_ed.public_key().0.to_vec(),
+        identity_mldsa_private: keys.identity_mldsa_sk.clone(),
+        identity_mldsa_public: keys.identity_mldsa_pk.clone(),
         identity_dh_private: keys.identity_dh.private_key_bytes().0.to_vec(),
         identity_dh_public: keys.identity_dh.public_key().0.to_vec(),
         signed_prekey_private: keys.signed_prekey.private_key_bytes().0.to_vec(),

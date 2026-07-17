@@ -1330,6 +1330,7 @@ dependencies = [
  "criterion",
  "ed25519-dalek",
  "fips203",
+ "fips204",
  "hex",
  "hkdf",
  "rand 0.8.5",
@@ -1562,6 +1563,18 @@ dependencies = [
  "rand_core 0.6.4",
  "sha3",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "fips204"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9fb5a367b9846933e271a3c2a992930743f82ae5e8cb7faa780715a80fa0b15"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha2",
+ "sha3",
  "zeroize",
 ]
 

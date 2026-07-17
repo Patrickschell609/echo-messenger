@@ -997,6 +997,8 @@ async fn check_and_rotate_keys(app: &AppHandle) {
     // Build a KeyMaterial with new keys for upload
     let upload_keys = echo_client::identity::KeyMaterial {
         identity_ed: keys.identity_ed,
+        identity_mldsa_pk: keys.identity_mldsa_pk,
+        identity_mldsa_sk: keys.identity_mldsa_sk,
         identity_dh: keys.identity_dh,
         signed_prekey: new_spk,
         signed_prekey_id: new_spk_id,
@@ -1101,6 +1103,8 @@ async fn check_and_refresh_sender_cert(app: &AppHandle) {
 
     let upload_keys = echo_client::identity::KeyMaterial {
         identity_ed: keys.identity_ed,
+        identity_mldsa_pk: keys.identity_mldsa_pk,
+        identity_mldsa_sk: keys.identity_mldsa_sk,
         identity_dh: keys.identity_dh,
         signed_prekey: keys.signed_prekey,
         signed_prekey_id: identity_state.signed_prekey_id,

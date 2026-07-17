@@ -13,6 +13,7 @@ use zeroize::Zeroize;
 use echo_crypto::crypto::ed25519::Ed25519KeyPair;
 use echo_crypto::crypto::kdf;
 use echo_crypto::crypto::pq_kem;
+use echo_crypto::crypto::pq_sign;
 use echo_crypto::crypto::x25519::X25519KeyPair;
 use echo_crypto::ratchet::state::RatchetState;
 use echo_crypto::ratchet::x4dh::X4DHInitResult;
@@ -26,6 +27,9 @@ const ONE_TIME_PREKEY_COUNT: u32 = 100;
 
 pub struct KeyMaterial {
     pub identity_ed: Ed25519KeyPair,
+    /// ML-DSA-87 identity signing keypair (post-quantum half of the hybrid).
+    pub identity_mldsa_pk: Vec<u8>,
+    pub identity_mldsa_sk: Vec<u8>,
     pub identity_dh: X25519KeyPair,
     pub signed_prekey: X25519KeyPair,
     pub signed_prekey_id: u32,
@@ -67,6 +71,7 @@ impl KeyMaterial {
 
     pub fn generate() -> Self {
         let identity_ed = Ed25519KeyPair::generate();
+        let (identity_mldsa_pk, identity_mldsa_sk) = pq_sign::pq_sign_keygen();
         let identity_dh = X25519KeyPair::generate();
         let signed_prekey = X25519KeyPair::generate();
         let signed_prekey_id = 1;
@@ -83,6 +88,8 @@ impl KeyMaterial {
 
         Self {
             identity_ed,
+            identity_mldsa_pk,
+            identity_mldsa_sk,
             identity_dh,
             signed_prekey,
             signed_prekey_id,
@@ -104,6 +111,11 @@ pub struct IdentityState {
     pub device_id: Uuid,
     pub identity_ed_private: Vec<u8>,
     pub identity_ed_public: Vec<u8>,
+    /// ML-DSA-87 identity signing keypair (post-quantum half of the hybrid).
+    #[serde(default)]
+    pub identity_mldsa_private: Vec<u8>,
+    #[serde(default)]
+    pub identity_mldsa_public: Vec<u8>,
     pub identity_dh_private: Vec<u8>,
     pub identity_dh_public: Vec<u8>,
     pub signed_prekey_private: Vec<u8>,
@@ -144,6 +156,8 @@ impl Drop for IdentityState {
     fn drop(&mut self) {
         self.identity_ed_private.zeroize();
         self.identity_ed_public.zeroize();
+        self.identity_mldsa_private.zeroize();
+        self.identity_mldsa_public.zeroize();
         self.identity_dh_private.zeroize();
         self.identity_dh_public.zeroize();
         self.signed_prekey_private.zeroize();
@@ -188,6 +202,8 @@ impl IdentityState {
 
         ReconstructedKeys {
             identity_ed,
+            identity_mldsa_pk: self.identity_mldsa_public.clone(),
+            identity_mldsa_sk: self.identity_mldsa_private.clone(),
             identity_dh,
             signed_prekey,
             pq_sk: PqSecretKey(self.pq_sk.clone()),
@@ -198,6 +214,9 @@ impl IdentityState {
 
 pub struct ReconstructedKeys {
     pub identity_ed: Ed25519KeyPair,
+    /// ML-DSA-87 identity signing keypair (post-quantum half of the hybrid).
+    pub identity_mldsa_pk: Vec<u8>,
+    pub identity_mldsa_sk: Vec<u8>,
     pub identity_dh: X25519KeyPair,
     pub signed_prekey: X25519KeyPair,
     pub pq_sk: PqSecretKey,
@@ -290,6 +309,8 @@ impl IdentityStore {
             device_id,
             identity_ed_private: keys.identity_ed.private_key_bytes().0.to_vec(),
             identity_ed_public: keys.identity_ed.public_key().0.to_vec(),
+            identity_mldsa_private: keys.identity_mldsa_sk.clone(),
+            identity_mldsa_public: keys.identity_mldsa_pk.clone(),
             identity_dh_private: keys.identity_dh.private_key_bytes().0.to_vec(),
             identity_dh_public: keys.identity_dh.public_key().0.to_vec(),
             signed_prekey_private: keys.signed_prekey.private_key_bytes().0.to_vec(),
@@ -428,6 +449,15 @@ impl IdentityStore {
 
     pub fn load_server_transparency_key(&self) -> Option<String> {
         self.vault.read_file::<String>("server_transparency_key.enc").ok()
+    }
+
+    pub fn save_sender_cert(&self, cert: &SenderCertificate) -> Result<()> {
+        self.vault.write_file("sender_cert.enc", cert)?;
+        Ok(())
+    }
+
+    pub fn load_sender_cert(&self) -> Option<SenderCertificate> {
+        self.vault.read_file::<SenderCertificate>("sender_cert.enc").ok()
     }
 }
 
