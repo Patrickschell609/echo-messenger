@@ -182,6 +182,7 @@ pub(crate) async fn cmd_session(
                 server_pubkey = Some(sth_resp.server_public_key);
             }
         }
+        let server_ml_dsa = hex::decode(store.load_server_ml_dsa_key().unwrap_or_default()).unwrap_or_default();
 
         match transparency::verify_transparency(
             tp,
@@ -189,6 +190,7 @@ pub(crate) async fn cmd_session(
             &idk_bytes,
             last_sth.as_ref(),
             server_pubkey.as_deref(),
+            &server_ml_dsa,
         ) {
             Ok(()) => {
                 println!("Key transparency: VERIFIED");
@@ -206,6 +208,7 @@ pub(crate) async fn cmd_session(
                         &idk_bytes,
                         None,
                         server_pubkey.as_deref(),
+                        &server_ml_dsa,
                     ) {
                         Ok(()) => {
                             println!("Key transparency: VERIFIED (TOFU reset)");
@@ -625,12 +628,14 @@ async fn cmd_monitor(
         return Err(anyhow::anyhow!("Key mismatch detected — possible compromise"));
     }
 
+    let server_ml_dsa = hex::decode(store.load_server_ml_dsa_key().unwrap_or_default()).unwrap_or_default();
     transparency::verify_transparency(
         &proof,
         &state.identity_ed_public,
         &state.identity_dh_public,
         last_sth.as_ref(),
         server_pubkey.as_deref(),
+        &server_ml_dsa,
     )?;
 
     store.save_last_sth(&proof.sth)?;

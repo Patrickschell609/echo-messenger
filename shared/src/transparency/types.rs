@@ -68,6 +68,9 @@ pub struct SignedTreeHead {
     pub timestamp: u64,
     /// Ed25519 signature over the signable bytes
     pub signature: Vec<u8>,
+    /// ML-DSA-87 signature over the same signable bytes (post-quantum half).
+    #[serde(default)]
+    pub ml_dsa_signature: Vec<u8>,
 }
 
 /// Domain separation prefix for STH signatures.
@@ -169,6 +172,7 @@ mod tests {
             root_hash: [0xAA; 32],
             timestamp: 1700000000,
             signature: vec![],
+            ml_dsa_signature: vec![],
         };
         let bytes = sth.signable_bytes();
         assert!(bytes.starts_with(b"ECHO-KT-STH-v1"));

@@ -493,8 +493,10 @@ pub async fn get_sth(
         root_hash: root,
         timestamp: now,
         signature: vec![],
+        ml_dsa_signature: vec![],
     };
     sth.signature = state.transparency_key.sign(&sth.signable_bytes());
+    sth.ml_dsa_signature = state.transparency_key.sign_ml_dsa(&sth.signable_bytes());
 
     Ok(Json(SthResponse {
         sth,
@@ -677,8 +679,10 @@ async fn build_transparency_proof(
         root_hash: root,
         timestamp: now,
         signature: vec![],
+        ml_dsa_signature: vec![],
     };
     sth.signature = state.transparency_key.sign(&sth.signable_bytes());
+    sth.ml_dsa_signature = state.transparency_key.sign_ml_dsa(&sth.signable_bytes());
 
     // Generate inclusion proof
     let proof_hashes = transparency::generate_inclusion_proof(&leaf_hashes, target_idx as u64);

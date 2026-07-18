@@ -21,12 +21,15 @@ pub fn verify_transparency(
     expected_identity_dh_key: &[u8],
     last_sth: Option<&SignedTreeHead>,
     server_pubkey_hex: Option<&str>,
+    server_ml_dsa_pubkey: &[u8],
 ) -> Result<()> {
-    // 1. Verify STH signature
-    let _ = server_pubkey_hex; // no longer needed — key is hardcoded
+    // 1. Verify STH hybrid signature. The Ed25519 key is pinned in the binary
+    // (primary anchor); the ML-DSA key is supplied by the caller from its cache
+    // and adds post-quantum protection on top of the pin.
+    let _ = server_pubkey_hex; // no longer needed — Ed25519 key is hardcoded
     let pubkey = IdentityPublicKey(SERVER_TRANSPARENCY_PUBKEY);
 
-    verify_sth(&bundle.sth, &pubkey)
+    verify_sth(&bundle.sth, &pubkey, server_ml_dsa_pubkey)
         .map_err(|_| anyhow!("TRANSPARENCY FAILURE: STH signature invalid"))?;
 
     // 2. Verify leaf matches fetched keys

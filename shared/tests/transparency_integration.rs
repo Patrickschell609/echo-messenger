@@ -4,9 +4,15 @@
 //! Also tests attack detection: key swaps, tree rewrites, and omissions.
 
 use echo_crypto::crypto::ed25519::Ed25519KeyPair;
+use echo_crypto::crypto::pq_sign;
 use echo_crypto::transparency::*;
 
 // ─── Helpers ───
+
+/// Fixed test server ML-DSA-87 key (post-quantum half). Returns (public, secret).
+fn test_sth_ml_dsa() -> (Vec<u8>, Vec<u8>) {
+    pq_sign::pq_sign_keygen_from_seed(&[44u8; 32])
+}
 
 fn make_leaf(device_idx: u8, seq: i64) -> TransparencyLeaf {
     use sha2::{Digest, Sha256};
@@ -41,8 +47,10 @@ fn build_signed_tree(
         root_hash: root,
         timestamp: now,
         signature: vec![],
+        ml_dsa_signature: vec![],
     };
     sth.signature = keypair.sign(&sth.signable_bytes());
+    sth.ml_dsa_signature = pq_sign::pq_sign(&test_sth_ml_dsa().1, &sth.signable_bytes()).unwrap();
 
     (hashes, sth)
 }
@@ -58,7 +66,7 @@ fn test_full_transparency_flow() {
     let (hashes, sth) = build_signed_tree(&leaves, &server_key);
 
     // Verify STH signature
-    assert!(verify_sth(&sth, &server_key.public_key()).is_ok());
+    assert!(verify_sth(&sth, &server_key.public_key(), &test_sth_ml_dsa().0).is_ok());
 
     // Generate and verify inclusion proof for each device
     for (i, leaf) in leaves.iter().enumerate() {
@@ -273,10 +281,10 @@ fn test_sth_wrong_key_rejected() {
     let (_, sth) = build_signed_tree(&leaves, &server_key);
 
     // Verify with correct key
-    assert!(verify_sth(&sth, &server_key.public_key()).is_ok());
+    assert!(verify_sth(&sth, &server_key.public_key(), &test_sth_ml_dsa().0).is_ok());
 
     // Verify with attacker key — should fail
-    assert!(verify_sth(&sth, &attacker_key.public_key()).is_err());
+    assert!(verify_sth(&sth, &attacker_key.public_key(), &test_sth_ml_dsa().0).is_err());
 }
 
 #[test]
@@ -290,7 +298,7 @@ fn test_sth_tampered_root_rejected() {
     sth.root_hash[0] ^= 0xFF;
 
     // Signature should no longer be valid
-    assert!(verify_sth(&sth, &server_key.public_key()).is_err());
+    assert!(verify_sth(&sth, &server_key.public_key(), &test_sth_ml_dsa().0).is_err());
 }
 
 // ─── Test: Large Tree ───
@@ -303,7 +311,7 @@ fn test_large_tree_100_entries() {
     let leaves: Vec<_> = (0..100u8).map(|i| make_leaf(i, i as i64 + 1)).collect();
     let (hashes, sth) = build_signed_tree(&leaves, &server_key);
 
-    assert!(verify_sth(&sth, &server_key.public_key()).is_ok());
+    assert!(verify_sth(&sth, &server_key.public_key(), &test_sth_ml_dsa().0).is_ok());
 
     // Verify inclusion for every leaf
     for i in 0..100u64 {
@@ -360,7 +368,7 @@ fn test_ffi_verify_transparency_proof() {
 
     let result = echo_crypto::ffi_api::ffi_verify_transparency_proof(
         proof_json,
-        server_key.public_key().0.to_vec(),
+        [server_key.public_key().0.to_vec(), test_sth_ml_dsa().0].concat(),
         leaf.identity_key.clone(),
         leaf.identity_dh_key.clone(),
         None,
@@ -399,7 +407,7 @@ fn test_ffi_verify_rejects_wrong_keys() {
     // Pass wrong expected identity key
     let result = echo_crypto::ffi_api::ffi_verify_transparency_proof(
         proof_json,
-        server_key.public_key().0.to_vec(),
+        [server_key.public_key().0.to_vec(), test_sth_ml_dsa().0].concat(),
         vec![0xFF; 32], // wrong key
         leaf.identity_dh_key.clone(),
         None,

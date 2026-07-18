@@ -686,10 +686,13 @@ pub fn ffi_verify_transparency_proof(
     let bundle: TransparencyProofBundle =
         serde_json::from_str(&proof_json).map_err(|e| format!("invalid proof JSON: {}", e))?;
 
-    let pubkey = id_pub_from_bytes(&server_pubkey)?;
+    // Ed25519 key is the first 32 bytes; an optional ML-DSA key follows.
+    let ed_bytes = server_pubkey.get(..32).unwrap_or(&server_pubkey);
+    let pubkey = id_pub_from_bytes(ed_bytes)?;
+    let server_ml_dsa = server_pubkey.get(32..).unwrap_or(&[]);
 
-    // 1. Verify STH signature
-    verify_sth(&bundle.sth, &pubkey)
+    // 1. Verify STH hybrid signature
+    verify_sth(&bundle.sth, &pubkey, server_ml_dsa)
         .map_err(|_| "TRANSPARENCY FAILURE: STH signature invalid".to_string())?;
 
     // 2. Verify leaf matches expected keys

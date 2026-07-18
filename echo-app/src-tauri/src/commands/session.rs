@@ -82,6 +82,10 @@ pub async fn establish_session(
             server_pubkey = Some(sth_resp.server_public_key);
         }
     }
+    let server_ml_dsa = {
+        let vault = state.vault.lock().unwrap();
+        hex::decode(vault.load_server_ml_dsa_key().unwrap_or_default()).unwrap_or_default()
+    };
 
     // Verify transparency (sync) — auto-recover on stale cache
     let mut verified = false;
@@ -95,6 +99,7 @@ pub async fn establish_session(
             &idk_bytes,
             last_sth.as_ref(),
             server_pubkey.as_deref(),
+            &server_ml_dsa,
         ) {
             Ok(()) => {
                 let vault = state.vault.lock().unwrap();
@@ -116,6 +121,7 @@ pub async fn establish_session(
                         &idk_bytes,
                         None,
                         server_pubkey.as_deref(),
+                        &server_ml_dsa,
                     ) {
                         Ok(()) => {
                             vault.save_last_sth(&tp.sth).ok();

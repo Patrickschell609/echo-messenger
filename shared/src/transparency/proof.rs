@@ -233,10 +233,16 @@ fn verify_consistency_inner(
     }
 }
 
-/// Verify a Signed Tree Head's Ed25519 signature.
-pub fn verify_sth(sth: &SignedTreeHead, server_public_key: &IdentityPublicKey) -> Result<()> {
+/// Verify a Signed Tree Head's hybrid Ed25519 + ML-DSA-87 signature.
+/// Both halves are mandatory — no classical-only downgrade.
+pub fn verify_sth(
+    sth: &SignedTreeHead,
+    server_public_key: &IdentityPublicKey,
+    server_ml_dsa_pubkey: &[u8],
+) -> Result<()> {
     let signable = sth.signable_bytes();
-    Ed25519KeyPair::verify(server_public_key, &signable, &sth.signature)
+    Ed25519KeyPair::verify(server_public_key, &signable, &sth.signature)?;
+    crate::crypto::pq_sign::pq_verify(server_ml_dsa_pubkey, &signable, &sth.ml_dsa_signature)
 }
 
 fn largest_power_of_2_less_than(n: usize) -> usize {
@@ -368,48 +374,83 @@ mod tests {
     fn test_verify_sth_signature() {
         use crate::crypto::ed25519::Ed25519KeyPair;
 
+        use crate::crypto::pq_sign;
         let keypair = Ed25519KeyPair::generate();
+        let (ml_pk, ml_sk) = pq_sign::pq_sign_keygen();
         let sth = SignedTreeHead {
             tree_size: 5,
             root_hash: [0xAA; 32],
             timestamp: 1700000000,
             signature: vec![], // placeholder
+            ml_dsa_signature: vec![],
         };
 
         let signable = sth.signable_bytes();
         let sig = keypair.sign(&signable);
+        let ml_sig = pq_sign::pq_sign(&ml_sk, &signable).unwrap();
 
         let signed_sth = SignedTreeHead {
             signature: sig,
+            ml_dsa_signature: ml_sig,
             ..sth
         };
 
-        assert!(verify_sth(&signed_sth, &keypair.public_key()).is_ok());
+        assert!(verify_sth(&signed_sth, &keypair.public_key(), &ml_pk).is_ok());
     }
 
     #[test]
     fn test_reject_bad_sth_signature() {
         use crate::crypto::ed25519::Ed25519KeyPair;
 
+        use crate::crypto::pq_sign;
         let keypair = Ed25519KeyPair::generate();
         let other_keypair = Ed25519KeyPair::generate();
+        let (ml_pk, ml_sk) = pq_sign::pq_sign_keygen();
 
         let sth = SignedTreeHead {
             tree_size: 5,
             root_hash: [0xAA; 32],
             timestamp: 1700000000,
             signature: vec![],
+            ml_dsa_signature: vec![],
         };
         let signable = sth.signable_bytes();
         let sig = keypair.sign(&signable);
+        let ml_sig = pq_sign::pq_sign(&ml_sk, &signable).unwrap();
 
         let signed_sth = SignedTreeHead {
             signature: sig,
+            ml_dsa_signature: ml_sig,
             ..sth
         };
 
-        // Verify against wrong key
-        assert!(verify_sth(&signed_sth, &other_keypair.public_key()).is_err());
+        // Verify against wrong Ed25519 key — must fail even though the ML-DSA half is valid.
+        assert!(verify_sth(&signed_sth, &other_keypair.public_key(), &ml_pk).is_err());
+    }
+
+    #[test]
+    fn test_verify_sth_requires_ml_dsa() {
+        use crate::crypto::ed25519::Ed25519KeyPair;
+        use crate::crypto::pq_sign;
+
+        let keypair = Ed25519KeyPair::generate();
+        let (ml_pk, ml_sk) = pq_sign::pq_sign_keygen();
+        let mut sth = SignedTreeHead {
+            tree_size: 7,
+            root_hash: [0xBB; 32],
+            timestamp: 1700000000,
+            signature: vec![],
+            ml_dsa_signature: vec![],
+        };
+        let signable = sth.signable_bytes();
+        sth.signature = keypair.sign(&signable);
+        sth.ml_dsa_signature = pq_sign::pq_sign(&ml_sk, &signable).unwrap();
+        assert!(verify_sth(&sth, &keypair.public_key(), &ml_pk).is_ok());
+
+        // Stripped ML-DSA signature -> rejected even though the Ed25519 half is valid.
+        let mut stripped = sth.clone();
+        stripped.ml_dsa_signature = Vec::new();
+        assert!(verify_sth(&stripped, &keypair.public_key(), &ml_pk).is_err());
     }
 
     #[test]
