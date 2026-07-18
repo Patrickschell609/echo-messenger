@@ -69,7 +69,7 @@ pub async fn send_message(
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return Err("Not connected".to_string()),
         }
@@ -367,7 +367,7 @@ pub async fn send_file(
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return Err("Not connected".to_string()),
         }
@@ -548,7 +548,7 @@ async fn send_encrypted_payload(
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return Err("Not connected".to_string()),
         }

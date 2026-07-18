@@ -9,12 +9,12 @@ use crate::state::{AppState, GroupChatMessage, GroupInfo};
 
 /// Helper: build an authenticated HttpClient from app state.
 fn build_http(state: &AppState) -> Result<HttpClient, String> {
-    let (device_id, ed_bytes) = {
+    let (device_id, ed_bytes, ml_dsa) = {
         let identity = state.identity.lock().unwrap();
         let id_state = identity.as_ref().ok_or("not signed in")?;
         let mut ed = [0u8; 32];
         ed.copy_from_slice(&id_state.identity_ed_private);
-        (id_state.device_id, ed)
+        (id_state.device_id, ed, id_state.identity_mldsa_private.clone())
     }; // identity lock released
 
     let http = state.http.lock().unwrap();
@@ -23,6 +23,7 @@ fn build_http(state: &AppState) -> Result<HttpClient, String> {
         http_ref.base_url(),
         device_id,
         &ed_bytes,
+        &ml_dsa,
     ))
 }
 
@@ -312,7 +313,7 @@ async fn distribute_sender_key(
                             let device_id = id_state.device_id;
                             let h = state.http.lock().unwrap();
                             h.as_ref().map(|c| {
-                                HttpClient::with_auth(c.base_url(), device_id, &ed_bytes)
+                                HttpClient::with_auth(c.base_url(), device_id, &ed_bytes, &id_state.identity_mldsa_private)
                             })
                         };
 

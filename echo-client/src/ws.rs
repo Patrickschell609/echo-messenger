@@ -55,6 +55,8 @@ struct WsAuthMessage {
     timestamp: String,
     nonce: String,
     signature: String,
+    #[serde(default)]
+    ml_dsa_signature: String,
 }
 
 /// Auth response from server.
@@ -68,10 +70,11 @@ pub struct WsClient {
     ws_url: String,
     device_id: Uuid,
     ed25519_private: [u8; 32],
+    ml_dsa_private: Vec<u8>,
 }
 
 impl WsClient {
-    pub fn new(base_url: &str, device_id: Uuid, ed25519_private: &[u8; 32]) -> Self {
+    pub fn new(base_url: &str, device_id: Uuid, ed25519_private: &[u8; 32], ml_dsa_private: &[u8]) -> Self {
         // Convert http(s):// to ws(s)://
         let ws_url = if base_url.starts_with("https://") {
             base_url.replacen("https://", "wss://", 1)
@@ -84,6 +87,7 @@ impl WsClient {
             ws_url,
             device_id,
             ed25519_private: *ed25519_private,
+            ml_dsa_private: ml_dsa_private.to_vec(),
         }
     }
 
@@ -201,11 +205,22 @@ impl WsClient {
         let signature = signing_key.sign(&message);
         let sig_hex = hex::encode(signature.to_bytes());
 
+        // Post-quantum half: ML-DSA-87 signature over the same message.
+        let ml_dsa_sig_hex = if !self.ml_dsa_private.is_empty() {
+            hex::encode(
+                echo_crypto::crypto::pq_sign::pq_sign(&self.ml_dsa_private, &message)
+                    .unwrap_or_default(),
+            )
+        } else {
+            String::new()
+        };
+
         WsAuthMessage {
             device_id: device_id_str,
             timestamp: timestamp_str,
             nonce: nonce_hex,
             signature: sig_hex,
+            ml_dsa_signature: ml_dsa_sig_hex,
         }
     }
 }

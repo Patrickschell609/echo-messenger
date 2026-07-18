@@ -11,6 +11,8 @@ use crate::identity::KeyMaterial;
 pub struct AuthCredentials {
     pub device_id: Uuid,
     pub signing_key: ed25519_dalek::SigningKey,
+    /// ML-DSA-87 identity private key for the post-quantum half of request auth.
+    pub ml_dsa_private: Vec<u8>,
 }
 
 pub struct HttpClient {
@@ -36,8 +38,13 @@ impl HttpClient {
         }
     }
 
-    /// Create an authenticated client with Ed25519 signing.
-    pub fn with_auth(base_url: &str, device_id: Uuid, ed25519_private: &[u8; 32]) -> Self {
+    /// Create an authenticated client with hybrid Ed25519 + ML-DSA-87 signing.
+    pub fn with_auth(
+        base_url: &str,
+        device_id: Uuid,
+        ed25519_private: &[u8; 32],
+        ml_dsa_private: &[u8],
+    ) -> Self {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(ed25519_private);
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -45,6 +52,7 @@ impl HttpClient {
             auth: Some(AuthCredentials {
                 device_id,
                 signing_key,
+                ml_dsa_private: ml_dsa_private.to_vec(),
             }),
         }
     }
@@ -60,7 +68,7 @@ impl HttpClient {
         method: &str,
         path: &str,
         body: Option<&[u8]>,
-    ) -> Option<(String, String, String, String)> {
+    ) -> Option<(String, String, String, String, String)> {
         let auth = self.auth.as_ref()?;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -91,7 +99,17 @@ impl HttpClient {
         let signature = auth.signing_key.sign(&message);
         let sig_hex = hex::encode(signature.to_bytes());
 
-        Some((device_id_str, timestamp_str, nonce_hex, sig_hex))
+        // Post-quantum half: ML-DSA-87 signature over the same message.
+        let ml_dsa_sig_hex = if !auth.ml_dsa_private.is_empty() {
+            hex::encode(
+                echo_crypto::crypto::pq_sign::pq_sign(&auth.ml_dsa_private, &message)
+                    .unwrap_or_default(),
+            )
+        } else {
+            String::new()
+        };
+
+        Some((device_id_str, timestamp_str, nonce_hex, sig_hex, ml_dsa_sig_hex))
     }
 
     /// Add auth headers to a request builder if credentials are available.
@@ -102,12 +120,13 @@ impl HttpClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> reqwest::RequestBuilder {
-        if let Some((device_id, timestamp, nonce, signature)) = self.sign_request(method, path, body) {
+        if let Some((device_id, timestamp, nonce, signature, ml_dsa_signature)) = self.sign_request(method, path, body) {
             req = req
                 .header("x-device-id", device_id)
                 .header("x-auth-timestamp", timestamp)
                 .header("x-auth-nonce", nonce)
-                .header("x-auth-signature", signature);
+                .header("x-auth-signature", signature)
+                .header("x-auth-ml-dsa-signature", ml_dsa_signature);
         }
         req
     }

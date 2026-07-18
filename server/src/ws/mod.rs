@@ -24,6 +24,8 @@ struct WsAuthMessage {
     timestamp: String,
     nonce: String, // 16-byte random hex — prevents replay
     signature: String,
+    #[serde(default)]
+    ml_dsa_signature: String,
 }
 
 /// Inbound message from an authenticated client.
@@ -258,15 +260,15 @@ async fn authenticate_ws(socket: &mut WebSocket, state: &AppState) -> Result<Uui
         }
     }
 
-    // Look up identity key
-    let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT identity_key FROM devices WHERE id = $1")
+    // Look up identity keys (Ed25519 + ML-DSA public)
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT identity_key, ml_dsa_identity_key FROM devices WHERE id = $1")
             .bind(device_id)
             .fetch_optional(&state.db)
             .await
             .map_err(|e| format!("db error: {}", e))?;
 
-    let (identity_key_bytes,) = row.ok_or_else(|| "device not found".to_string())?;
+    let (identity_key_bytes, ml_dsa_identity_key) = row.ok_or_else(|| "device not found".to_string())?;
 
     if identity_key_bytes.len() != 32 {
         return Err("stored identity_key wrong size".into());
@@ -295,6 +297,13 @@ async fn authenticate_ws(socket: &mut WebSocket, state: &AppState) -> Result<Uui
     verifying_key
         .verify(&message, &signature)
         .map_err(|_| "signature verification failed".to_string())?;
+
+    // Verify the ML-DSA-87 half over the same message (mandatory — hybrid WS auth).
+    let ml_dsa_sig = hex::decode(&auth.ml_dsa_signature)
+        .map_err(|_| "invalid ML-DSA signature hex".to_string())?;
+    let ml_dsa_pk = ml_dsa_identity_key.ok_or_else(|| "device missing ML-DSA identity".to_string())?;
+    echo_crypto::crypto::pq_sign::pq_verify(&ml_dsa_pk, &message, &ml_dsa_sig)
+        .map_err(|_| "ML-DSA signature verification failed".to_string())?;
 
     Ok(device_id)
 }

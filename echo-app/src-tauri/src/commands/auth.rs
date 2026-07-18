@@ -46,7 +46,7 @@ pub async fn create_account(
     // Claim screen name (requires authenticated HTTP client)
     let mut ed_bytes_tmp = [0u8; 32];
     ed_bytes_tmp.copy_from_slice(&keys.identity_ed.private_key_bytes().0);
-    let auth_http_tmp = HttpClient::with_auth(&server_url, device_id, &ed_bytes_tmp);
+    let auth_http_tmp = HttpClient::with_auth(&server_url, device_id, &ed_bytes_tmp, &keys.identity_mldsa_sk);
     let screen_name_result = if !screen_name.is_empty() {
         match auth_http_tmp.set_screen_name(&screen_name).await {
             Ok(resp) => Some(resp.screen_name),
@@ -126,7 +126,7 @@ pub async fn create_account(
     // Build authenticated HTTP client
     let mut ed_bytes = [0u8; 32];
     ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-    let auth_http = HttpClient::with_auth(&server_url, device_id, &ed_bytes);
+    let auth_http = HttpClient::with_auth(&server_url, device_id, &ed_bytes, &identity_state.identity_mldsa_private);
 
     // Update app state
     *state.http.lock().unwrap() = Some(auth_http);
@@ -188,7 +188,7 @@ pub async fn sign_on(
     // Build authenticated HTTP client
     let mut ed_bytes = [0u8; 32];
     ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-    let auth_http = HttpClient::with_auth(&server_url, device_id, &ed_bytes);
+    let auth_http = HttpClient::with_auth(&server_url, device_id, &ed_bytes, &identity_state.identity_mldsa_private);
 
     let short_code = identity_state.short_code.clone();
     let screen_name = identity_state.screen_name.clone();
@@ -269,7 +269,7 @@ pub async fn generate_invites(
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return Err("No HTTP client".to_string()),
         }

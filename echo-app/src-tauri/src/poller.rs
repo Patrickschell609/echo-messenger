@@ -169,7 +169,7 @@ async fn try_ws_connect(
 )> {
     let state = app.state::<AppState>();
 
-    let (base_url, device_id, ed_private) = {
+    let (base_url, device_id, ed_private, ml_dsa) = {
         let identity = state.identity.lock().unwrap();
         let identity_state = identity.as_ref().ok_or_else(|| anyhow::anyhow!("no identity"))?;
         let http = state.http.lock().unwrap();
@@ -178,10 +178,10 @@ async fn try_ws_connect(
         let device_id = identity_state.device_id;
         let mut ed_bytes = [0u8; 32];
         ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-        (base_url, device_id, ed_bytes)
+        (base_url, device_id, ed_bytes, identity_state.identity_mldsa_private.clone())
     };
 
-    let ws_client = WsClient::new(&base_url, device_id, &ed_private);
+    let ws_client = WsClient::new(&base_url, device_id, &ed_private, &ml_dsa);
     ws_client.connect().await
 }
 
@@ -248,7 +248,7 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
             h.as_ref().map(|http| {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             })
         };
         if let Some(http) = http {
@@ -799,6 +799,7 @@ fn send_delivery_receipt(app: &AppHandle, sender: uuid::Uuid, timestamp: u64) {
                         http.base_url(),
                         id_state.device_id,
                         &ed_bytes,
+                        &id_state.identity_mldsa_private,
                     )
                 }
                 None => return,
@@ -822,7 +823,7 @@ async fn ack_single(app: &AppHandle, msg_id: i64) {
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                (identity_state.device_id, HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes))
+                (identity_state.device_id, HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private))
             }
             None => return,
         }
@@ -848,7 +849,7 @@ async fn poll_messages(app: &AppHandle) -> anyhow::Result<()> {
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return Ok(()),
         }
@@ -884,7 +885,7 @@ async fn check_and_replenish_prekeys(app: &AppHandle) {
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return,
         }
@@ -1000,7 +1001,7 @@ async fn check_and_rotate_keys(app: &AppHandle) {
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return,
         }
@@ -1100,7 +1101,7 @@ async fn check_and_refresh_sender_cert(app: &AppHandle) {
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return,
         }
@@ -1194,7 +1195,7 @@ async fn drain_outbox(app: &AppHandle) {
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&identity_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), identity_state.device_id, &ed_bytes, &identity_state.identity_mldsa_private)
             }
             None => return,
         }
@@ -1433,7 +1434,7 @@ async fn poll_group_messages(app: &AppHandle) {
             Some(http) => {
                 let mut ed_bytes = [0u8; 32];
                 ed_bytes.copy_from_slice(&id_state.identity_ed_private);
-                HttpClient::with_auth(http.base_url(), id_state.device_id, &ed_bytes)
+                HttpClient::with_auth(http.base_url(), id_state.device_id, &ed_bytes, &id_state.identity_mldsa_private)
             }
             None => return,
         }

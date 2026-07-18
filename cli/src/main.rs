@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
             let state = store.load()?;
             let mut ed_bytes = [0u8; 32];
             ed_bytes.copy_from_slice(&state.identity_ed_private);
-            let auth_http = HttpClient::with_auth(&cli.server, state.device_id, &ed_bytes);
+            let auth_http = HttpClient::with_auth(&cli.server, state.device_id, &ed_bytes, &state.identity_mldsa_private);
             cmd_session(&auth_http, &store, &device).await
         }
         Commands::Send { to, msg } => cmd_send(&http, &store, &to, &msg).await,
@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
             let state = store.load()?;
             let mut ed_bytes = [0u8; 32];
             ed_bytes.copy_from_slice(&state.identity_ed_private);
-            let auth_http = HttpClient::with_auth(&cli.server, state.device_id, &ed_bytes);
+            let auth_http = HttpClient::with_auth(&cli.server, state.device_id, &ed_bytes, &state.identity_mldsa_private);
             cmd_recv(&auth_http, &store).await
         }
         Commands::Monitor => cmd_monitor(&http, &store).await,

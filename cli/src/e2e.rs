@@ -68,7 +68,7 @@ pub async fn run_e2e(server: &str, invite1: &str, invite2: &str) -> Result<()> {
         let state_b = store_b.load()?;
         let mut ed = [0u8; 32];
         ed.copy_from_slice(&state_b.identity_ed_private);
-        let auth_http = HttpClient::with_auth(server, state_b.device_id, &ed);
+        let auth_http = HttpClient::with_auth(server, state_b.device_id, &ed, &state_b.identity_mldsa_private);
 
         match auth_http.lookup_by_code(code).await {
             Ok(resp) => {
@@ -96,7 +96,7 @@ pub async fn run_e2e(server: &str, invite1: &str, invite2: &str) -> Result<()> {
         let state_a = store_a.load()?;
         let mut ed = [0u8; 32];
         ed.copy_from_slice(&state_a.identity_ed_private);
-        let auth_http = HttpClient::with_auth(server, state_a.device_id, &ed);
+        let auth_http = HttpClient::with_auth(server, state_a.device_id, &ed, &state_a.identity_mldsa_private);
 
         match cmd_session(&auth_http, &store_a, &bob_device.to_string()).await {
             Ok(()) => { pass("Alice → Bob session"); passed += 1; }
@@ -117,7 +117,7 @@ pub async fn run_e2e(server: &str, invite1: &str, invite2: &str) -> Result<()> {
         let state_b = store_b.load()?;
         let mut ed = [0u8; 32];
         ed.copy_from_slice(&state_b.identity_ed_private);
-        let auth_http = HttpClient::with_auth(server, state_b.device_id, &ed);
+        let auth_http = HttpClient::with_auth(server, state_b.device_id, &ed, &state_b.identity_mldsa_private);
 
         match cmd_recv(&auth_http, &store_b).await {
             Ok(()) => { pass("Bob receives + decrypts"); passed += 1; }
@@ -138,7 +138,7 @@ pub async fn run_e2e(server: &str, invite1: &str, invite2: &str) -> Result<()> {
         let state_a = store_a.load()?;
         let mut ed = [0u8; 32];
         ed.copy_from_slice(&state_a.identity_ed_private);
-        let auth_http = HttpClient::with_auth(server, state_a.device_id, &ed);
+        let auth_http = HttpClient::with_auth(server, state_a.device_id, &ed, &state_a.identity_mldsa_private);
 
         match cmd_recv(&auth_http, &store_a).await {
             Ok(()) => { pass("Alice receives reply"); passed += 1; }
@@ -157,7 +157,7 @@ pub async fn run_e2e(server: &str, invite1: &str, invite2: &str) -> Result<()> {
         let state_b = store_b.load()?;
         let mut ed = [0u8; 32];
         ed.copy_from_slice(&state_b.identity_ed_private);
-        let auth_http = HttpClient::with_auth(server, state_b.device_id, &ed);
+        let auth_http = HttpClient::with_auth(server, state_b.device_id, &ed, &state_b.identity_mldsa_private);
 
         match cmd_recv(&auth_http, &store_b).await {
             Ok(()) => { pass("Bob receives normal message"); passed += 1; }

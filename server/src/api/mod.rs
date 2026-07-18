@@ -197,15 +197,15 @@ pub async fn authenticate_device(
         }
     }
 
-    // Look up the device's identity_key (Ed25519 public key) from DB
-    let row: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT identity_key FROM devices WHERE id = $1"
+    // Look up the device's identity keys (Ed25519 + ML-DSA public) from DB
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT identity_key, ml_dsa_identity_key FROM devices WHERE id = $1"
     )
     .bind(device_id)
     .fetch_optional(db)
     .await?;
 
-    let (identity_key_bytes,) = row.ok_or(ApiError::Unauthorized)?;
+    let (identity_key_bytes, ml_dsa_identity_key) = row.ok_or(ApiError::Unauthorized)?;
 
     if identity_key_bytes.len() != 32 {
         return Err(ApiError::Internal("stored identity_key wrong size".into()));
@@ -240,6 +240,18 @@ pub async fn authenticate_device(
 
     verifying_key
         .verify(&message, &signature)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    // Verify the ML-DSA-87 half over the same message (mandatory — hybrid request auth).
+    let ml_dsa_sig_hex = headers
+        .get("x-auth-ml-dsa-signature")
+        .ok_or(ApiError::Unauthorized)?
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("invalid ML-DSA signature header".into()))?;
+    let ml_dsa_sig = hex::decode(ml_dsa_sig_hex)
+        .map_err(|_| ApiError::BadRequest("invalid ML-DSA signature hex".into()))?;
+    let ml_dsa_pk = ml_dsa_identity_key.ok_or(ApiError::Unauthorized)?;
+    echo_crypto::crypto::pq_sign::pq_verify(&ml_dsa_pk, &message, &ml_dsa_sig)
         .map_err(|_| ApiError::Unauthorized)?;
 
     Ok(device_id)
