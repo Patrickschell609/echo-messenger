@@ -32,6 +32,14 @@ pub fn pq_sign_keygen() -> (Vec<u8>, Vec<u8>) {
     (pk.into_bytes().to_vec(), sk.into_bytes().to_vec())
 }
 
+/// Deterministically derive an ML-DSA-87 key pair from a 32-byte seed (FIPS 204 xi).
+/// Used to pair a stable ML-DSA server key to the existing Ed25519 transparency key
+/// without introducing a second key file.
+pub fn pq_sign_keygen_from_seed(seed: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+    let (pk, sk) = ml_dsa_87::KG::keygen_from_seed(seed);
+    (pk.into_bytes().to_vec(), sk.into_bytes().to_vec())
+}
+
 /// Sign `message` with an ML-DSA-87 secret key (empty FIPS 204 context string).
 pub fn pq_sign(secret_key: &[u8], message: &[u8]) -> Result<Vec<u8>> {
     let sk_bytes: [u8; SK_LEN] = secret_key

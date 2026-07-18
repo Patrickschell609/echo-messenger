@@ -260,6 +260,7 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
                         server_pk = Some(arr);
                         let vault = state.vault.lock().unwrap();
                         vault.save_server_transparency_key(&sth_resp.server_public_key).ok();
+                        vault.save_server_ml_dsa_key(&sth_resp.server_ml_dsa_public).ok();
                         tracing::info!("▶ MSG #{} — fetched and cached transparency key", qm.id);
                     }
                 }
@@ -278,10 +279,15 @@ async fn process_single_message(app: &AppHandle, qm: &echo_client::http::QueuedM
         }
     };
 
+    let server_ml_dsa_pk = {
+        let vault = state.vault.lock().unwrap();
+        hex::decode(vault.load_server_ml_dsa_key().unwrap_or_default()).unwrap_or_default()
+    };
     let (sender_cert, inner) = match echo_crypto::sealed_sender::unseal_message(
         &keys.identity_dh,
         &envelope,
         &server_pk,
+        &server_ml_dsa_pk,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -1142,7 +1148,7 @@ async fn check_and_refresh_sender_cert(app: &AppHandle) {
         Ok(mut cert) => {
             let mut ed_priv = [0u8; 32];
             ed_priv.copy_from_slice(&identity_state.identity_ed_private);
-            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv, &identity_state.identity_mldsa_private);
             ed_priv.zeroize();
             let vault = state.vault.lock().unwrap();
             if vault.save_sender_cert(&cert).is_err() {

@@ -135,7 +135,7 @@ async fn cmd_register(http: &HttpClient, store: &IdentityStore, invite: &str) ->
         if let Ok(mut cert) = bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
             let mut ed_priv = [0u8; 32];
             ed_priv.copy_from_slice(&state.identity_ed_private);
-            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv, &state.identity_mldsa_private);
             store.save_sender_cert(&cert)?;
         }
     }
@@ -178,6 +178,7 @@ pub(crate) async fn cmd_session(
         if server_pubkey.is_none() {
             if let Ok(sth_resp) = http.fetch_sth().await {
                 store.save_server_transparency_key(&sth_resp.server_public_key).ok();
+                store.save_server_ml_dsa_key(&sth_resp.server_ml_dsa_public).ok();
                 server_pubkey = Some(sth_resp.server_public_key);
             }
         }
@@ -369,6 +370,7 @@ pub(crate) async fn cmd_recv(
                 match http.fetch_sth().await {
                     Ok(sth_resp) => {
                         store.save_server_transparency_key(&sth_resp.server_public_key).ok();
+                        store.save_server_ml_dsa_key(&sth_resp.server_ml_dsa_public).ok();
                         let bytes = hex::decode(&sth_resp.server_public_key)?;
                         let mut arr = [0u8; 32];
                         arr.copy_from_slice(&bytes);
@@ -382,10 +384,13 @@ pub(crate) async fn cmd_recv(
             }
         };
 
+        let server_ml_dsa_pk =
+            hex::decode(store.load_server_ml_dsa_key().unwrap_or_default()).unwrap_or_default();
         let (sender_cert, inner) = match echo_crypto::sealed_sender::unseal_message(
             &keys.identity_dh,
             &envelope,
             &server_pk,
+            &server_ml_dsa_pk,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -601,6 +606,7 @@ async fn cmd_monitor(
     if server_pubkey.is_none() {
         if let Ok(sth_resp) = http.fetch_sth().await {
             store.save_server_transparency_key(&sth_resp.server_public_key).ok();
+            store.save_server_ml_dsa_key(&sth_resp.server_ml_dsa_public).ok();
             server_pubkey = Some(sth_resp.server_public_key);
         }
     }

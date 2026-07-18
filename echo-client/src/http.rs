@@ -870,6 +870,8 @@ pub struct SetScreenNameResponse {
 pub struct SthResponse {
     pub sth: echo_crypto::transparency::SignedTreeHead,
     pub server_public_key: String,
+    #[serde(default)]
+    pub server_ml_dsa_public: String,
 }
 
 // ─── Group API ───

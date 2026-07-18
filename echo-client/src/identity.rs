@@ -451,6 +451,15 @@ impl IdentityStore {
         self.vault.read_file::<String>("server_transparency_key.enc").ok()
     }
 
+    pub fn save_server_ml_dsa_key(&self, pubkey_hex: &str) -> Result<()> {
+        self.vault.write_file("server_ml_dsa_key.enc", &pubkey_hex.to_string())?;
+        Ok(())
+    }
+
+    pub fn load_server_ml_dsa_key(&self) -> Option<String> {
+        self.vault.read_file::<String>("server_ml_dsa_key.enc").ok()
+    }
+
     pub fn save_sender_cert(&self, cert: &SenderCertificate) -> Result<()> {
         self.vault.write_file("sender_cert.enc", cert)?;
         Ok(())
@@ -525,12 +534,15 @@ pub fn build_sender_cert(state: &IdentityState) -> SenderCertificate {
         expiry,
         server_signature: vec![0u8; 64], // POC placeholder (no server sig)
         sender_signature: vec![],
+        sender_ml_dsa_identity: state.identity_mldsa_public.clone(),
+        server_ml_dsa_signature: Vec::new(),
+        sender_ml_dsa_signature: Vec::new(),
     };
 
     // Counter-sign with our Ed25519 key (C1)
     let mut ed_priv = [0u8; 32];
     ed_priv.copy_from_slice(&state.identity_ed_private);
-    echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+    echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv, &state.identity_mldsa_private);
     ed_priv.zeroize();
 
     cert

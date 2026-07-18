@@ -317,6 +317,7 @@ pub async fn upload_prekeys(
     cert_msg.extend_from_slice(&identity_key);
     cert_msg.extend_from_slice(&expiry.to_le_bytes());
     let server_sig = state.transparency_key.sign(&cert_msg);
+    let server_ml_dsa_sig = state.transparency_key.sign_ml_dsa(&cert_msg);
 
     let sender_cert = echo_crypto::sealed_sender::SenderCertificate {
         sender_identity: echo_crypto::IdentityPublicKey({
@@ -328,6 +329,10 @@ pub async fn upload_prekeys(
         expiry,
         server_signature: server_sig,
         sender_signature: vec![], // Client must counter-sign after receiving (C1)
+        // PQ half: bind the sender's ML-DSA identity and add the server's ML-DSA signature.
+        sender_ml_dsa_identity: ml_dsa_identity_key.clone().unwrap_or_default(),
+        server_ml_dsa_signature: server_ml_dsa_sig,
+        sender_ml_dsa_signature: vec![], // Client counter-signs with its ML-DSA key
     };
 
     let cert_bytes = bincode::serialize(&sender_cert).ok();
@@ -472,6 +477,8 @@ pub async fn fetch_prekeys(
 pub struct SthResponse {
     pub sth: SignedTreeHead,
     pub server_public_key: String,
+    /// Server's ML-DSA-87 public key (hex) — post-quantum half for verifying certs and STHs.
+    pub server_ml_dsa_public: String,
 }
 
 pub async fn get_sth(
@@ -492,6 +499,7 @@ pub async fn get_sth(
     Ok(Json(SthResponse {
         sth,
         server_public_key: hex::encode(state.transparency_key.public_key),
+        server_ml_dsa_public: hex::encode(&state.transparency_key.ml_dsa_public),
     }))
 }
 

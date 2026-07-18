@@ -78,6 +78,7 @@ pub async fn establish_session(
         if let Ok(sth_resp) = http.fetch_sth().await {
             let vault = state.vault.lock().unwrap();
             vault.save_server_transparency_key(&sth_resp.server_public_key).ok();
+            vault.save_server_ml_dsa_key(&sth_resp.server_ml_dsa_public).ok();
             server_pubkey = Some(sth_resp.server_public_key);
         }
     }

@@ -20,6 +20,9 @@ use rand::{rngs::OsRng, RngCore};
 pub struct TransparencySigningKey {
     signing: SigningKey,
     pub public_key: [u8; 32],
+    /// Paired ML-DSA-87 key (post-quantum half), derived from the Ed25519 seed.
+    ml_dsa_secret: Vec<u8>,
+    pub ml_dsa_public: Vec<u8>,
 }
 
 /// Argon2id parameters for key encryption.
@@ -110,17 +113,35 @@ impl TransparencySigningKey {
         };
 
         let verifying = signing.verifying_key();
+        // Derive a paired ML-DSA-87 key deterministically from the Ed25519 seed
+        // (domain-separated) so there is no second key file to manage. Stable across
+        // restarts, so the published ML-DSA public key never changes.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"echo-server-mldsa-v1");
+        h.update(signing.to_bytes());
+        let ml_seed: [u8; 32] = h.finalize().into();
+        let (ml_dsa_public, ml_dsa_secret) =
+            echo_crypto::crypto::pq_sign::pq_sign_keygen_from_seed(&ml_seed);
         Ok(Self {
             signing,
             public_key: verifying.to_bytes(),
+            ml_dsa_secret,
+            ml_dsa_public,
         })
     }
 
-    /// Sign data with the transparency key.
+    /// Sign data with the transparency key (Ed25519 half).
     pub fn sign(&self, data: &[u8]) -> Vec<u8> {
         use ed25519_dalek::Signer;
         let sig = self.signing.sign(data);
         sig.to_bytes().to_vec()
+    }
+
+    /// Sign data with the paired ML-DSA-87 key (post-quantum half).
+    pub fn sign_ml_dsa(&self, data: &[u8]) -> Vec<u8> {
+        echo_crypto::crypto::pq_sign::pq_sign(&self.ml_dsa_secret, data)
+            .expect("server ML-DSA signing failed")
     }
 }
 

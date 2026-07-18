@@ -196,7 +196,7 @@ async fn register_identity(
         if let Ok(mut sc) = bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
             let mut ed_priv = [0u8; 32];
             ed_priv.copy_from_slice(&state.identity_ed_private);
-            echo_crypto::sealed_sender::countersign_sender_cert(&mut sc, &ed_priv);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut sc, &ed_priv, &state.identity_mldsa_private);
             store.save_sender_cert(&sc)?;
         }
     }

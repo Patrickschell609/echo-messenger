@@ -107,7 +107,7 @@ pub async fn create_account(
         if let Ok(mut cert) = bincode::deserialize::<echo_crypto::sealed_sender::SenderCertificate>(&cert_bytes) {
             let mut ed_priv = [0u8; 32];
             ed_priv.copy_from_slice(&identity_state.identity_ed_private);
-            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv);
+            echo_crypto::sealed_sender::countersign_sender_cert(&mut cert, &ed_priv, &identity_state.identity_mldsa_private);
             ed_priv.zeroize();
             vault.save_sender_cert(&cert).map_err(|e| e.to_string())?;
         }

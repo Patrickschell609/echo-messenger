@@ -328,6 +328,9 @@ pub fn ffi_seal_message(
         expiry,
         server_signature: vec![0u8; 64], // POC placeholder
         sender_signature: vec![0u8; 64], // POC placeholder (no Ed25519 key available in FFI)
+        sender_ml_dsa_identity: Vec::new(),
+        server_ml_dsa_signature: Vec::new(),
+        sender_ml_dsa_signature: Vec::new(),
     };
 
     let envelope =
@@ -351,8 +354,10 @@ pub fn ffi_unseal_message(
         server_pubkey.get(..32).ok_or("server_pubkey must be 32 bytes")?,
     );
 
+    // Optional ML-DSA server key appended after the 32-byte Ed25519 key.
+    let server_ml_dsa = server_pubkey.get(32..).unwrap_or(&[]);
     let (cert, tr3_ciphertext) =
-        sealed_sender::unseal_message(&dh, &envelope, &spk).map_err(|e| e.to_string())?;
+        sealed_sender::unseal_message(&dh, &envelope, &spk, server_ml_dsa).map_err(|e| e.to_string())?;
 
     Ok(FfiUnsealResult {
         sender_identity: cert.sender_identity.0.to_vec(),

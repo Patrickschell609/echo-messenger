@@ -280,6 +280,16 @@ impl EncryptedVault {
         self.read_file::<String>("server_transparency_key.enc").ok()
     }
 
+    /// Save the server's ML-DSA-87 public key (post-quantum half).
+    pub fn save_server_ml_dsa_key(&self, pubkey_hex: &str) -> Result<()> {
+        self.write_file("server_ml_dsa_key.enc", &pubkey_hex.to_string())
+    }
+
+    /// Load the server's ML-DSA-87 public key.
+    pub fn load_server_ml_dsa_key(&self) -> Option<String> {
+        self.read_file::<String>("server_ml_dsa_key.enc").ok()
+    }
+
     /// Save the sender certificate received from the server.
     pub fn save_sender_cert<T: Serialize>(&self, cert: &T) -> Result<()> {
         self.write_file("sender_cert.enc", cert)

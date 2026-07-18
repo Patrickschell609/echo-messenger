@@ -32,6 +32,12 @@ fn test_server_key() -> Ed25519KeyPair {
     Ed25519KeyPair::from_private_bytes([42u8; 32])
 }
 
+/// Deterministic test server ML-DSA-87 key (post-quantum half). Returns (public, secret).
+/// The test only needs internal consistency, so a fixed seed suffices.
+fn test_server_ml_dsa() -> (Vec<u8>, Vec<u8>) {
+    pq_sign::pq_sign_keygen_from_seed(&[43u8; 32])
+}
+
 /// Helper: generate a full prekey bundle for a user.
 struct UserKeys {
     identity_ed: Ed25519KeyPair,
@@ -125,6 +131,8 @@ impl UserKeys {
         msg.extend_from_slice(&self.identity_ed.public_key().0);
         msg.extend_from_slice(&expiry.to_le_bytes());
         let server_sig = server_key.sign(&msg);
+        let (_server_ml_pk, server_ml_sk) = test_server_ml_dsa();
+        let server_ml_dsa_sig = pq_sign::pq_sign(&server_ml_sk, &msg).unwrap();
 
         let mut cert = SenderCertificate {
             sender_identity: self.identity_ed.public_key(),
@@ -132,9 +140,16 @@ impl UserKeys {
             expiry,
             server_signature: server_sig,
             sender_signature: vec![],
+            sender_ml_dsa_identity: self.identity_mldsa_pk.clone(),
+            server_ml_dsa_signature: server_ml_dsa_sig,
+            sender_ml_dsa_signature: vec![],
         };
-        // Counter-sign with sender's Ed25519 key (C1)
-        sealed_sender::countersign_sender_cert(&mut cert, &self.identity_ed.private_key_bytes().0);
+        // Counter-sign with sender's Ed25519 + ML-DSA keys (C1, hybrid)
+        sealed_sender::countersign_sender_cert(
+            &mut cert,
+            &self.identity_ed.private_key_bytes().0,
+            &self.identity_mldsa_sk,
+        );
         cert
     }
 }
@@ -464,7 +479,7 @@ fn test_sealed_sender_roundtrip() {
 
     // Bob unseals
     let (recovered_cert, recovered_payload) =
-        sealed_sender::unseal_message(&bob.identity_dh, &envelope, &test_server_key().public_key().0).unwrap();
+        sealed_sender::unseal_message(&bob.identity_dh, &envelope, &test_server_key().public_key().0, &test_server_ml_dsa().0).unwrap();
 
     assert_eq!(recovered_cert.sender_identity, alice.identity_ed.public_key());
     assert_eq!(recovered_cert.sender_device_id, alice.device_id);
@@ -486,8 +501,48 @@ fn test_sealed_sender_wrong_recipient_fails() {
     .unwrap();
 
     // Eve tries to unseal - must fail
-    let result = sealed_sender::unseal_message(&eve.identity_dh, &envelope, &test_server_key().public_key().0);
+    let result = sealed_sender::unseal_message(&eve.identity_dh, &envelope, &test_server_key().public_key().0, &test_server_ml_dsa().0);
     assert!(result.is_err(), "wrong recipient must not unseal");
+}
+
+/// Phase 3 hybrid cert: a sender certificate whose ML-DSA half is stripped or
+/// forged must be rejected on unseal, even when the Ed25519 halves are valid.
+#[test]
+fn test_hybrid_sender_cert_requires_ml_dsa() {
+    let alice = UserKeys::generate(1);
+    let bob = UserKeys::generate(2);
+    let server_pk = test_server_key().public_key().0;
+    let server_ml = test_server_ml_dsa().0;
+
+    // Baseline: a well-formed hybrid cert unseals fine.
+    let good = alice.sender_cert();
+    let env_good = sealed_sender::seal_message(&bob.identity_dh.public_key(), &good, b"hi").unwrap();
+    assert!(sealed_sender::unseal_message(&bob.identity_dh, &env_good, &server_pk, &server_ml).is_ok());
+
+    // Stripped server ML-DSA signature -> rejected (no classical-only downgrade).
+    let mut c1 = alice.sender_cert();
+    c1.server_ml_dsa_signature = Vec::new();
+    let env1 = sealed_sender::seal_message(&bob.identity_dh.public_key(), &c1, b"hi").unwrap();
+    assert!(
+        sealed_sender::unseal_message(&bob.identity_dh, &env1, &server_pk, &server_ml).is_err(),
+        "stripped server ML-DSA signature must be rejected"
+    );
+
+    // Forged sender ML-DSA counter-signature (from an unrelated key) -> rejected.
+    let (_wpk, wsk) = pq_sign::pq_sign_keygen();
+    let mut c2 = alice.sender_cert();
+    let mut sm = Vec::new();
+    sm.extend_from_slice(b"echo-sender-cert-v1:");
+    sm.extend_from_slice(&c2.sender_device_id.0);
+    sm.extend_from_slice(&c2.sender_identity.0);
+    sm.extend_from_slice(&c2.expiry.to_le_bytes());
+    sm.extend_from_slice(&c2.server_signature);
+    c2.sender_ml_dsa_signature = pq_sign::pq_sign(&wsk, &sm).unwrap();
+    let env2 = sealed_sender::seal_message(&bob.identity_dh.public_key(), &c2, b"hi").unwrap();
+    assert!(
+        sealed_sender::unseal_message(&bob.identity_dh, &env2, &server_pk, &server_ml).is_err(),
+        "forged sender ML-DSA counter-signature must be rejected"
+    );
 }
 
 #[test]
@@ -554,7 +609,7 @@ fn test_full_flow_x4dh_ratchet_sealed_sender() {
     // The server has ZERO knowledge of sender identity.
 
     // ── Step 5: Bob unseals the envelope ──
-    let (sender_cert, inner) = sealed_sender::unseal_message(&bob.identity_dh, &envelope, &test_server_key().public_key().0).unwrap();
+    let (sender_cert, inner) = sealed_sender::unseal_message(&bob.identity_dh, &envelope, &test_server_key().public_key().0, &test_server_ml_dsa().0).unwrap();
 
     // Bob now knows who sent it
     assert_eq!(sender_cert.sender_identity, alice.identity_ed.public_key());
@@ -794,6 +849,8 @@ fn sender_cert_with_expiry(user: &UserKeys, expiry: u64) -> SenderCertificate {
     msg.extend_from_slice(&user.identity_ed.public_key().0);
     msg.extend_from_slice(&expiry.to_le_bytes());
     let server_sig = server_key.sign(&msg);
+    let (_server_ml_pk, server_ml_sk) = test_server_ml_dsa();
+    let server_ml_dsa_sig = pq_sign::pq_sign(&server_ml_sk, &msg).unwrap();
 
     let mut cert = SenderCertificate {
         sender_identity: user.identity_ed.public_key(),
@@ -801,8 +858,15 @@ fn sender_cert_with_expiry(user: &UserKeys, expiry: u64) -> SenderCertificate {
         expiry,
         server_signature: server_sig,
         sender_signature: vec![],
+        sender_ml_dsa_identity: user.identity_mldsa_pk.clone(),
+        server_ml_dsa_signature: server_ml_dsa_sig,
+        sender_ml_dsa_signature: vec![],
     };
-    sealed_sender::countersign_sender_cert(&mut cert, &user.identity_ed.private_key_bytes().0);
+    sealed_sender::countersign_sender_cert(
+        &mut cert,
+        &user.identity_ed.private_key_bytes().0,
+        &user.identity_mldsa_sk,
+    );
     cert
 }
 
@@ -854,7 +918,7 @@ fn test_expired_sender_cert_is_rejected_on_receive() {
     let env_ok =
         sealed_sender::seal_message(&bob.identity_dh.public_key(), &fresh, payload).unwrap();
     assert!(
-        sealed_sender::unseal_message(&bob.identity_dh, &env_ok, &server_pk).is_ok(),
+        sealed_sender::unseal_message(&bob.identity_dh, &env_ok, &server_pk, &test_server_ml_dsa().0).is_ok(),
         "a current sender cert must be accepted"
     );
 
@@ -863,7 +927,7 @@ fn test_expired_sender_cert_is_rejected_on_receive() {
     let env_bad =
         sealed_sender::seal_message(&bob.identity_dh.public_key(), &expired, payload).unwrap();
     assert!(
-        sealed_sender::unseal_message(&bob.identity_dh, &env_bad, &server_pk).is_err(),
+        sealed_sender::unseal_message(&bob.identity_dh, &env_bad, &server_pk, &test_server_ml_dsa().0).is_err(),
         "an expired sender cert must be rejected on receive (reproduces the bug)"
     );
 }

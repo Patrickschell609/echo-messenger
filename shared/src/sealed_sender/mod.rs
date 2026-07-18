@@ -26,6 +26,15 @@ pub struct SenderCertificate {
     /// Prevents a compromised server from forging certs for arbitrary identities.
     #[serde(default)]
     pub sender_signature: Vec<u8>,
+    /// Sender's ML-DSA-87 identity public key (post-quantum half of the identity).
+    #[serde(default)]
+    pub sender_ml_dsa_identity: Vec<u8>,
+    /// Server's ML-DSA-87 signature over (device_id || identity || expiry) — PQ half of the server sig.
+    #[serde(default)]
+    pub server_ml_dsa_signature: Vec<u8>,
+    /// Sender's ML-DSA-87 counter-signature — PQ half of the counter-sig.
+    #[serde(default)]
+    pub sender_ml_dsa_signature: Vec<u8>,
 }
 
 /// Verify a sender certificate's server signature AND sender counter-signature.
@@ -38,8 +47,10 @@ pub struct SenderCertificate {
 pub fn verify_sender_cert(
     cert: &SenderCertificate,
     server_pubkey: &[u8; 32],
+    server_ml_dsa_pubkey: &[u8],
 ) -> Result<()> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use crate::crypto::pq_sign;
 
     if cert.server_signature.len() != 64 {
         return Err(EchoError::SealedSenderFailed);
@@ -71,6 +82,10 @@ pub fn verify_sender_cert(
     vk.verify(&msg, &sig)
         .map_err(|_| EchoError::SealedSenderFailed)?;
 
+    // Server ML-DSA-87 signature over the same message (mandatory PQ half).
+    pq_sign::pq_verify(server_ml_dsa_pubkey, &msg, &cert.server_ml_dsa_signature)
+        .map_err(|_| EchoError::SealedSenderFailed)?;
+
     // --- Verify sender counter-signature (C1: prevents server forgery) ---
     if cert.sender_signature.len() != 64 {
         return Err(EchoError::SealedSenderFailed);
@@ -93,6 +108,12 @@ pub fn verify_sender_cert(
     sender_vk.verify(&sender_msg, &sender_sig)
         .map_err(|_| EchoError::SealedSenderFailed)?;
 
+    // Sender ML-DSA-87 counter-signature over the same message (mandatory PQ half).
+    // Verified against the sender's ML-DSA identity carried in the cert, which is
+    // thereby self-authenticated (only its holder can produce this signature).
+    pq_sign::pq_verify(&cert.sender_ml_dsa_identity, &sender_msg, &cert.sender_ml_dsa_signature)
+        .map_err(|_| EchoError::SealedSenderFailed)?;
+
     Ok(())
 }
 
@@ -101,6 +122,7 @@ pub fn verify_sender_cert(
 pub fn countersign_sender_cert(
     cert: &mut SenderCertificate,
     sender_ed25519_private: &[u8; 32],
+    sender_ml_dsa_private: &[u8],
 ) {
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::Signer;
@@ -115,6 +137,12 @@ pub fn countersign_sender_cert(
     let sk = SigningKey::from_bytes(sender_ed25519_private);
     let sig = sk.sign(&msg);
     cert.sender_signature = sig.to_bytes().to_vec();
+
+    // ML-DSA-87 counter-signature over the same message (post-quantum half).
+    if !sender_ml_dsa_private.is_empty() {
+        cert.sender_ml_dsa_signature =
+            crate::crypto::pq_sign::pq_sign(sender_ml_dsa_private, &msg).unwrap_or_default();
+    }
 }
 
 /// Seal a message (sender side).
@@ -156,7 +184,9 @@ pub fn seal_message(
 }
 
 /// Maximum serialized sender certificate size (4 KB — generous for Ed25519 + device ID + expiry).
-const MAX_CERT_LEN: usize = 4096;
+// Hybrid certs carry ML-DSA-87 material (identity 2592 + two 4627-byte signatures
+// ≈ 12 KB) on top of the Ed25519 fields, so the bound is well above that.
+const MAX_CERT_LEN: usize = 16384;
 
 /// Unseal a message (recipient side).
 /// Server pubkey is REQUIRED -- sender certificate signature and expiry are always verified (H1).
@@ -165,6 +195,7 @@ pub fn unseal_message(
     our_identity_dh: &X25519KeyPair,
     envelope: &SealedEnvelope,
     server_pubkey: &[u8; 32],
+    server_ml_dsa_pubkey: &[u8],
 ) -> Result<(SenderCertificate, Vec<u8>)> {
     // DH with ephemeral key
     let dh_output = our_identity_dh.dh(&envelope.ephemeral_public)?;
@@ -201,7 +232,7 @@ pub fn unseal_message(
         .map_err(|_| EchoError::SealedSenderFailed)?;
 
     // Always verify sender cert (H1: server_pubkey is now mandatory)
-    verify_sender_cert(&cert, server_pubkey)?;
+    verify_sender_cert(&cert, server_pubkey, server_ml_dsa_pubkey)?;
 
     let tr3_ciphertext = payload[cert_end..].to_vec();
 
