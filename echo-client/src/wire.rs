@@ -114,6 +114,12 @@ pub enum WireMessage {
         /// Ed25519 signature binding identity_dh_key to identity_key (C4)
         #[serde(default)]
         sender_identity_dh_signature: Vec<u8>,
+        /// Alice's ML-DSA-87 identity public key (post-quantum half of the hybrid identity)
+        #[serde(default)]
+        sender_ml_dsa_identity_key: Vec<u8>,
+        /// ML-DSA-87 signature binding identity_dh_key to identity (C4, PQ half)
+        #[serde(default)]
+        sender_identity_dh_ml_dsa_signature: Vec<u8>,
         /// Ephemeral X25519 public key
         ephemeral_public: Vec<u8>,
         /// PQ KEM ciphertext

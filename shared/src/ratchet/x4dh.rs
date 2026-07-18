@@ -145,6 +145,8 @@ impl X4DH {
         their_identity_dh_key: &PublicKey,
         their_identity_ed: Option<&IdentityPublicKey>,
         their_dh_signature: Option<&[u8]>,
+        their_identity_mldsa: Option<&[u8]>,
+        their_dh_ml_dsa_signature: Option<&[u8]>,
         their_ephemeral: &PublicKey,
         pq_ciphertext: &PqCiphertext,
     ) -> Result<X4DHResponseResult> {
@@ -160,11 +162,26 @@ impl X4DH {
         let dh_sig = their_dh_signature.filter(|s| !s.is_empty()).ok_or_else(|| {
             EchoError::InvalidMessage("prekey message missing identity_dh_key binding signature (C4)".into())
         })?;
+        // PQ half of the C4 binding — both are MANDATORY (no classical-only downgrade).
+        let their_ml_dsa = their_identity_mldsa.filter(|s| !s.is_empty()).ok_or_else(|| {
+            EchoError::InvalidMessage("prekey message missing initiator ML-DSA identity".into())
+        })?;
+        let dh_ml_dsa_sig = their_dh_ml_dsa_signature.filter(|s| !s.is_empty()).ok_or_else(|| {
+            EchoError::InvalidMessage("prekey message missing ML-DSA DH-binding signature (C4)".into())
+        })?;
         {
             let mut dh_bind_msg = Vec::new();
             dh_bind_msg.extend_from_slice(b"echo-dh-binding:");
             dh_bind_msg.extend_from_slice(&their_identity_dh_key.0);
-            Ed25519KeyPair::verify(their_ed, &dh_bind_msg, dh_sig)?;
+            hybrid_sig::hybrid_verify(
+                &their_ed.0,
+                their_ml_dsa,
+                &dh_bind_msg,
+                &hybrid_sig::HybridSignature {
+                    ed25519: dh_sig.to_vec(),
+                    ml_dsa: dh_ml_dsa_sig.to_vec(),
+                },
+            )?;
         }
         // DH1: SPK_B × IK_A (X25519 identity DH key)
         let dh1 = our_signed_prekey.dh(their_identity_dh_key)?;

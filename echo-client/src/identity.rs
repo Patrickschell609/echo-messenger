@@ -551,3 +551,16 @@ pub fn sign_identity_dh_binding(state: &IdentityState) -> Vec<u8> {
     msg.extend_from_slice(&state.identity_dh_public);
     ed_key.sign(&msg)
 }
+
+/// C3/C4 (post-quantum half): Sign our identity_dh_key with our ML-DSA-87 identity
+/// key, over the same message as [`sign_identity_dh_binding`]. Empty for identities
+/// created before PQ signatures.
+pub fn sign_identity_dh_binding_ml_dsa(state: &IdentityState) -> Vec<u8> {
+    if state.identity_mldsa_private.is_empty() {
+        return Vec::new();
+    }
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"echo-dh-binding:");
+    msg.extend_from_slice(&state.identity_dh_public);
+    pq_sign::pq_sign(&state.identity_mldsa_private, &msg).unwrap_or_default()
+}

@@ -169,6 +169,8 @@ pub async fn establish_session(
         sender_identity_key: identity_state.identity_ed_public.clone(),
         sender_identity_dh_key: identity_state.identity_dh_public.clone(),
         sender_identity_dh_signature: identity::sign_identity_dh_binding(&identity_state),
+        sender_ml_dsa_identity_key: identity_state.identity_mldsa_public.clone(),
+        sender_identity_dh_ml_dsa_signature: identity::sign_identity_dh_binding_ml_dsa(&identity_state),
         ephemeral_public: meta.ephemeral_public.clone(),
         pq_ciphertext: meta.pq_ciphertext.clone(),
         used_one_time_prekey_id: meta.used_one_time_prekey_id,

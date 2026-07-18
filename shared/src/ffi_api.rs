@@ -220,6 +220,8 @@ pub fn ffi_x4dh_respond(
         &their_dh,
         None, // C4: caller should provide Alice's Ed25519 key
         None, // C4: caller should provide DH key signature
+        None, // C4: caller should provide Alice's ML-DSA identity
+        None, // C4: caller should provide ML-DSA DH key signature
         &their_eph,
         &PqCiphertext(pq_ciphertext),
     )

@@ -261,6 +261,14 @@ async fn distribute_sender_key(
                             let id = state.identity.lock().unwrap();
                             id.as_ref().map(|s| echo_client::identity::sign_identity_dh_binding(s)).unwrap_or_default()
                         },
+                        sender_ml_dsa_identity_key: {
+                            let id = state.identity.lock().unwrap();
+                            id.as_ref().map(|s| s.identity_mldsa_public.clone()).unwrap_or_default()
+                        },
+                        sender_identity_dh_ml_dsa_signature: {
+                            let id = state.identity.lock().unwrap();
+                            id.as_ref().map(|s| echo_client::identity::sign_identity_dh_binding_ml_dsa(s)).unwrap_or_default()
+                        },
                         ephemeral_public: meta.ephemeral_public.clone(),
                         pq_ciphertext: meta.pq_ciphertext.clone(),
                         used_one_time_prekey_id: meta.used_one_time_prekey_id,

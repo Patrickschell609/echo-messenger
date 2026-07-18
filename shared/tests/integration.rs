@@ -256,6 +256,8 @@ fn test_x4dh_session_establishment() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -287,6 +289,8 @@ fn test_x4dh_without_one_time_prekey() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -326,6 +330,8 @@ fn test_triple_ratchet_single_message() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -363,6 +369,8 @@ fn test_triple_ratchet_multiple_messages_one_direction() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -400,6 +408,8 @@ fn test_triple_ratchet_bidirectional() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -499,6 +509,8 @@ fn test_full_flow_x4dh_ratchet_sealed_sender() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -596,6 +608,8 @@ fn test_replay_protection() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )
@@ -691,6 +705,8 @@ fn test_x4dh_respond_rejects_missing_identity_ed() {
         &init.identity_dh_public,
         None, // no initiator identity — must be rejected, not zero-bound
         Some(&dh_sig),
+        None, // ML-DSA args irrelevant — rejected on missing Ed25519 identity first
+        None,
         &init.ephemeral_public,
         &init.pq_ciphertext,
     );
@@ -718,12 +734,41 @@ fn test_x4dh_respond_rejects_missing_dh_binding_sig() {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         None, // no DH-binding signature — must be rejected
+        None, // ML-DSA args irrelevant — rejected on missing Ed25519 DH-binding sig first
+        None,
         &init.ephemeral_public,
         &init.pq_ciphertext,
     );
     assert!(
         result.is_err(),
         "missing DH-binding signature must be rejected (H2)"
+    );
+}
+
+/// The hybrid flip (Phase 2.3): the initiator must reject a bundle whose ML-DSA
+/// half is stripped or forged, even though the Ed25519 half is perfectly valid.
+#[test]
+fn test_initiate_rejects_bad_ml_dsa_half() {
+    let alice = UserKeys::generate(1);
+    let bob = UserKeys::generate(2);
+
+    // Stripped ML-DSA identity key -> rejected (no silent classical-only downgrade).
+    let mut stripped = bob.bundle();
+    stripped.ml_dsa_identity_key = Vec::new();
+    assert!(
+        X4DH::initiate(&alice.identity_ed, &alice.identity_dh, &stripped).is_err(),
+        "bundle missing the ML-DSA identity key must be rejected"
+    );
+
+    // Forged ML-DSA signed-prekey signature (from an unrelated key) -> rejected,
+    // even though the Ed25519 signed-prekey signature is still valid.
+    let (_wrong_pk, wrong_sk) = pq_sign::pq_sign_keygen();
+    let mut forged = bob.bundle();
+    forged.signed_prekey_ml_dsa_signature =
+        pq_sign::pq_sign(&wrong_sk, &forged.signed_prekey.0).unwrap();
+    assert!(
+        X4DH::initiate(&alice.identity_ed, &alice.identity_dh, &forged).is_err(),
+        "bundle with a forged ML-DSA signed-prekey signature must be rejected"
     );
 }
 
@@ -777,6 +822,8 @@ fn establish_pair() -> (TripleRatchetSession, TripleRatchetSession) {
         &init.identity_dh_public,
         Some(&alice.identity_ed.public_key()),
         Some(&alice.identity_ed.sign(&[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat())),
+        Some(&alice.identity_mldsa_pk),
+        Some(&pq_sign::pq_sign(&alice.identity_mldsa_sk, &[b"echo-dh-binding:", alice.identity_dh.public_key().0.as_slice()].concat()).unwrap()),
         &init.ephemeral_public,
         &init.pq_ciphertext,
     )

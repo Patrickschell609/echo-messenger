@@ -281,6 +281,8 @@ pub(crate) async fn cmd_send(
             sender_identity_key: state.identity_ed_public.clone(),
             sender_identity_dh_key: state.identity_dh_public.clone(),
             sender_identity_dh_signature: identity::sign_identity_dh_binding(&state),
+            sender_ml_dsa_identity_key: state.identity_mldsa_public.clone(),
+            sender_identity_dh_ml_dsa_signature: identity::sign_identity_dh_binding_ml_dsa(&state),
             ephemeral_public: session_meta.ephemeral_public.clone(),
             pq_ciphertext: session_meta.pq_ciphertext.clone(),
             used_one_time_prekey_id: session_meta.used_one_time_prekey_id,
@@ -409,6 +411,8 @@ pub(crate) async fn cmd_recv(
                 sender_identity_key,
                 sender_identity_dh_key,
                 sender_identity_dh_signature,
+                sender_ml_dsa_identity_key,
+                sender_identity_dh_ml_dsa_signature,
                 ephemeral_public,
                 pq_ciphertext,
                 used_one_time_prekey_id,
@@ -419,7 +423,7 @@ pub(crate) async fn cmd_recv(
                 ratchet_header,
                 encrypted_header,
                 ciphertext,
-                Some((sender_identity_key, sender_identity_dh_key, sender_identity_dh_signature, ephemeral_public, pq_ciphertext, used_one_time_prekey_id)),
+                Some((sender_identity_key, sender_identity_dh_key, sender_identity_dh_signature, sender_ml_dsa_identity_key, sender_identity_dh_ml_dsa_signature, ephemeral_public, pq_ciphertext, used_one_time_prekey_id)),
             ),
             WireMessage::Normal {
                 ratchet_header,
@@ -460,7 +464,7 @@ pub(crate) async fn cmd_recv(
                     eprintln!("  [msg {}] decrypt failed: {}", qm.id, e);
                 }
             }
-        } else if let Some((sender_ik, sender_dh_key, sender_dh_sig, ephemeral_pub, pq_ct, _otpk_id)) = prekey_data {
+        } else if let Some((sender_ik, sender_dh_key, sender_dh_sig, sender_ml_dsa_ik, sender_dh_ml_dsa_sig, ephemeral_pub, pq_ct, _otpk_id)) = prekey_data {
             let mut eph = [0u8; 32];
             eph.copy_from_slice(&ephemeral_pub);
             let mut sdk = [0u8; 32];
@@ -475,6 +479,8 @@ pub(crate) async fn cmd_recv(
                 None
             };
             let sender_dh_sig_ref = if sender_dh_sig.is_empty() { None } else { Some(sender_dh_sig.as_slice()) };
+            let sender_ml_dsa_ref = if sender_ml_dsa_ik.is_empty() { None } else { Some(sender_ml_dsa_ik.as_slice()) };
+            let sender_dh_ml_dsa_sig_ref = if sender_dh_ml_dsa_sig.is_empty() { None } else { Some(sender_dh_ml_dsa_sig.as_slice()) };
 
             let otp_keypair = _otpk_id.and_then(|id| {
                 keys.one_time_prekeys.iter().find(|(kid, _)| *kid == id).map(|(_, kp)| kp)
@@ -489,6 +495,8 @@ pub(crate) async fn cmd_recv(
                 &echo_crypto::PublicKey(sdk),
                 sender_ed_key.as_ref(),
                 sender_dh_sig_ref,
+                sender_ml_dsa_ref,
+                sender_dh_ml_dsa_sig_ref,
                 &echo_crypto::PublicKey(eph),
                 &echo_crypto::PqCiphertext(pq_ct.clone()),
             ) {
